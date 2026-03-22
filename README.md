@@ -1,27 +1,50 @@
-# llm-notify
+<p align="center">
+  <h1 align="center">llm-notify</h1>
+  <p align="center">
+    <b>Feishu webhook notifier for Claude Code & Codex CLI</b>
+  </p>
+  <p align="center">
+    <a href="./README_CN.md">中文文档</a> &nbsp;|&nbsp; English
+  </p>
+  <p align="center">
+    <img src="https://img.shields.io/badge/python-3.6+-blue?logo=python&logoColor=white" alt="Python 3.6+">
+    <img src="https://img.shields.io/badge/dependencies-zero-brightgreen" alt="Zero Dependencies">
+    <img src="https://img.shields.io/badge/Claude_Code-hook-blueviolet?logo=anthropic" alt="Claude Code">
+    <img src="https://img.shields.io/badge/Codex_CLI-notify-orange?logo=openai" alt="Codex CLI">
+    <img src="https://img.shields.io/github/license/xwysyy/llm-notify" alt="License">
+  </p>
+</p>
 
-Feishu (飞书) webhook notifier for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [Codex CLI](https://github.com/openai/codex).
+---
 
-AI coding tasks can take minutes. Instead of watching a terminal, get a Feishu notification when it's done.
+AI coding tasks can run for minutes. Stop watching the terminal — get a **Feishu (飞书)** notification when the job is done.
 
-## Features
+## Highlights
 
-- Single Python 3 script, **zero dependencies** (stdlib only)
-- Works with both **Claude Code** and **Codex CLI**
-- Feishu signature verification (HMAC-SHA256)
-- **Duration filtering**: only notify when a task takes longer than N seconds
-- Self-contained in `~/.llm-notify/` — `scp` to another server and you're set
+- **Single file, zero dependencies** — Python 3 stdlib only, nothing to install
+- **Dual support** — works with both [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [Codex CLI](https://github.com/openai/codex)
+- **Smart filtering** — only notify when a task exceeds a configurable duration (e.g. 60s)
+- **Secure** — HMAC-SHA256 signature verification for Feishu webhooks
+- **Portable** — self-contained in `~/.llm-notify/`, `scp` to any server and go
 
 ## How It Works
 
 ```
-User prompt ──► UserPromptSubmit hook ──► prompt-start (record timestamp)
-                        ...
-  Task done ──► Stop hook / notify    ──► claude-stop / codex
-                                            │
-                                    elapsed > min_duration?
-                                        yes ──► Feishu webhook
-                                         no ──► skip
+                          ┌──────────────────────────────┐
+  User sends prompt ────► │  UserPromptSubmit hook        │
+                          │  prompt-start: save timestamp │
+                          └──────────────────────────────┘
+                                       ...
+                                  (AI working)
+                                       ...
+                          ┌──────────────────────────────┐
+  Task completes ───────► │  Stop hook / notify           │
+                          │  claude-stop / codex          │
+                          │                               │
+                          │  elapsed > min_duration?      │
+                          │    yes ──► Feishu webhook     │
+                          │     no ──► skip               │
+                          └──────────────────────────────┘
 ```
 
 ## Quick Start
@@ -29,17 +52,18 @@ User prompt ──► UserPromptSubmit hook ──► prompt-start (record times
 ### 1. Install
 
 ```bash
-# Clone to ~/.llm-notify
 git clone https://github.com/xwysyy/llm-notify.git ~/.llm-notify
 chmod +x ~/.llm-notify/llm-notify
 ```
 
-### 2. Create Feishu Webhook
+### 2. Create a Feishu Webhook
 
-1. Open Feishu **desktop app** (not mobile)
-2. Create a group (can be just yourself)
-3. Group Settings → Bots → Add Bot → **Custom Bot**
-4. Security: choose **Sign Verification**, copy the **Webhook URL** and **Secret**
+> Requires the Feishu **desktop app** (not mobile).
+
+1. Create a group chat (can be just yourself)
+2. **Group Settings** → **Bots** → **Add Bot** → **Custom Bot**
+3. Security: select **Sign Verification**
+4. Copy the **Webhook URL** and **Secret**
 
 ### 3. Configure
 
@@ -47,7 +71,7 @@ chmod +x ~/.llm-notify/llm-notify
 ~/.llm-notify/llm-notify init
 ```
 
-Follow the prompts to enter your Webhook URL, Secret, and minimum notification duration.
+You'll be prompted for: Webhook URL, Secret, keyword, and minimum duration.
 
 ### 4. Verify
 
@@ -55,111 +79,102 @@ Follow the prompts to enter your Webhook URL, Secret, and minimum notification d
 ~/.llm-notify/llm-notify test
 ```
 
-Check your Feishu group for the test message.
-
-### 5. Hook into Claude Code / Codex
+### 5. Hook into Your Tools
 
 ```bash
 ~/.llm-notify/llm-notify install
 ```
 
-This prints the config snippets. Apply them manually as described below.
+This prints config snippets — apply them as described below.
 
-## Configuration
-
-### config.json
-
-Created by `llm-notify init`, lives at `~/.llm-notify/config.json`:
-
-```json
-{
-  "webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx",
-  "secret": "your-secret-here",
-  "keyword": "[AI通知]",
-  "min_duration": 60
-}
-```
-
-| Field | Required | Description |
-|-------|----------|-------------|
-| `webhook` | Yes | Feishu bot webhook URL |
-| `secret` | No | HMAC-SHA256 signing secret |
-| `keyword` | No | Auto-prepended if message doesn't contain it (for keyword-based security) |
-| `min_duration` | No | Minimum task duration in seconds to trigger notification (default: 0 = always notify) |
+## Integration
 
 ### Claude Code
 
 Add to `~/.claude/settings.json` under `"hooks"`:
 
-```json
+```jsonc
 {
   "hooks": {
+    // ... your existing hooks ...
     "UserPromptSubmit": [
+      // ... your existing entries ...
       {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "~/.llm-notify/llm-notify prompt-start",
-            "timeout": 3
-          }
-        ]
+        "hooks": [{
+          "type": "command",
+          "command": "~/.llm-notify/llm-notify prompt-start",
+          "timeout": 3
+        }]
       }
     ],
     "Stop": [
       {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "~/.llm-notify/llm-notify claude-stop",
-            "timeout": 10
-          }
-        ]
+        "hooks": [{
+          "type": "command",
+          "command": "~/.llm-notify/llm-notify claude-stop",
+          "timeout": 10
+        }]
       }
     ]
   }
 }
 ```
 
-> If you already have `UserPromptSubmit` hooks, add the `prompt-start` entry as a new item in the array.
-
 ### Codex CLI
 
-**~/.codex/config.toml** — add at top level:
+**`~/.codex/config.toml`** :
 
 ```toml
+# Top level
 notify = ["~/.llm-notify/llm-notify", "codex"]
-```
 
-**~/.codex/config.toml** — enable hooks feature:
-
-```toml
+# Enable hooks feature (for duration filtering)
 [features]
 codex_hooks = true
 ```
 
-**~/.codex/hooks.json** — create this file:
+**`~/.codex/hooks.json`** (create this file):
 
 ```json
 {
   "hooks": {
     "UserPromptSubmit": [
       {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "~/.llm-notify/llm-notify prompt-start",
-            "timeout": 3
-          }
-        ]
+        "hooks": [{
+          "type": "command",
+          "command": "~/.llm-notify/llm-notify prompt-start",
+          "timeout": 3
+        }]
       }
     ]
   }
 }
 ```
 
-> The `notify` config handles task completion; `hooks.json` records the start time for duration filtering. If `codex_hooks` feature is unavailable in your Codex version, notifications still work — just without duration filtering.
+> **Note:** `notify` handles task completion; `hooks.json` records start time for duration filtering.
+> If `codex_hooks` is unavailable in your Codex version, notifications still work — just without duration filtering.
 
-## Notification Example
+## Configuration Reference
+
+`~/.llm-notify/config.json` (generated by `init`):
+
+```json
+{
+  "webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx",
+  "secret": "your-secret",
+  "keyword": "[AI通知]",
+  "min_duration": 60
+}
+```
+
+| Field | Required | Default | Description |
+|:------|:--------:|:-------:|:------------|
+| `webhook` | Yes | — | Feishu custom bot webhook URL |
+| `secret` | No | — | HMAC-SHA256 signing secret |
+| `keyword` | No | — | Auto-prepended to messages (for keyword-based bot security) |
+| `min_duration` | No | `0` | Minimum task duration (seconds) to trigger a notification. `0` = always notify |
+
+## Notification Preview
 
 ```
 [AI通知]
@@ -170,44 +185,34 @@ Claude Code 已完成
 摘要: Refactored the authentication module, updated 5 files...
 ```
 
-## Subcommands
+## CLI Reference
 
-| Command | Triggered by | Description |
-|---------|-------------|-------------|
-| `init` | User | Interactive setup, writes config.json |
+| Subcommand | Invoked by | Description |
+|:-----------|:-----------|:------------|
+| `init` | User | Interactive setup → writes `config.json` |
 | `test` | User | Send a test notification |
-| `install` | User | Print config snippets for Claude Code / Codex |
-| `prompt-start` | UserPromptSubmit hook | Record task start timestamp |
-| `claude-stop` | Claude Code Stop hook | Send notification (stdin JSON) |
-| `codex` | Codex legacy notify | Send notification (argv JSON) |
+| `install` | User | Print hook config snippets for Claude Code & Codex |
+| `prompt-start` | `UserPromptSubmit` hook | Record task start timestamp |
+| `claude-stop` | Claude Code `Stop` hook | Evaluate duration & send notification (stdin JSON) |
+| `codex` | Codex `notify` | Evaluate duration & send notification (argv JSON) |
 
-## Deploy to Another Server
+## Multi-Server Deploy
 
 ```bash
-scp -r ~/.llm-notify/ user@new-server:~/
-# Then on new-server:
-~/.llm-notify/llm-notify test
-# Configure hooks as above
+scp -r ~/.llm-notify/ user@new-server:~/.llm-notify/
+ssh user@new-server '~/.llm-notify/llm-notify test'
+# Then configure hooks on the new server
 ```
 
-If using the same Feishu group, the config.json works as-is. Machine name is included in every notification so you can tell which server finished.
+Each notification includes the **machine hostname**, so you always know which server finished.
 
 ## Troubleshooting
 
-**No notification received:**
-- Run `~/.llm-notify/llm-notify test` to verify webhook connectivity
-- Check that `min_duration` isn't filtering out short tasks (set to `0` to always notify)
-- For Claude Code: run with `claude --debug` and look for hook output
-- Verify webhook URL hasn't expired (Feishu doesn't expire webhooks, but check bot status)
-
-**Hook errors blocking Claude Code / Codex:**
-- This should never happen. All hook subcommands catch every exception and exit 0
-- Check stderr: `echo '{}' | ~/.llm-notify/llm-notify claude-stop 2>&1`
-
-**Duration filtering not working for Codex:**
-- Ensure `codex_hooks = true` is in `[features]` section of `~/.codex/config.toml`
-- Ensure `~/.codex/hooks.json` exists with the `UserPromptSubmit` hook
-- The `codex_hooks` feature may be under development in some Codex versions — notifications still work, just without duration filtering
+| Symptom | Fix |
+|:--------|:----|
+| No notification received | Run `llm-notify test` to verify connectivity. Check `min_duration` isn't filtering short tasks. |
+| Hook blocking Claude / Codex | Should never happen — all hook errors are caught and exit 0. Check: `echo '{}' \| llm-notify claude-stop 2>&1` |
+| Duration filter not working (Codex) | Ensure `codex_hooks = true` in `[features]` and `~/.codex/hooks.json` exists. |
 
 ## Requirements
 
@@ -216,4 +221,4 @@ If using the same Feishu group, the config.json works as-is. Machine name is inc
 
 ## License
 
-MIT
+[MIT](./LICENSE)
