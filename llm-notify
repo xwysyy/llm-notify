@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import socket
 import sys
 import time
@@ -15,6 +16,8 @@ import urllib.request
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 STATE_DIR = os.path.join(SCRIPT_DIR, "state")
+
+_SAFE_ID_RE = re.compile(r"[^a-zA-Z0-9_\-]")
 
 
 # ─── Utilities ───
@@ -26,11 +29,30 @@ def load_config():
         print("请先运行: llm-notify init", file=sys.stderr)
         sys.exit(1)
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+        cfg = json.load(f)
+    cfg["min_duration"] = int(cfg.get("min_duration", 0))
+    return cfg
 
 
 def get_hostname():
     return socket.gethostname()
+
+
+def extract_session_id(info):
+    """Extract session/thread ID from hook payload, compatible with both
+    Claude Code (session_id) and Codex (thread-id / session_id)."""
+    return (
+        info.get("session_id")
+        or info.get("thread-id")
+        or info.get("thread_id")
+        or "unknown"
+    )
+
+
+def safe_state_name(session_id):
+    """Sanitize session_id to a filesystem-safe name to prevent path traversal."""
+    name = _SAFE_ID_RE.sub("_", session_id)
+    return name[:128] if name else "unknown"
 
 
 def read_stdin_json():
@@ -39,7 +61,7 @@ def read_stdin_json():
         try:
             return json.loads(data)
         except json.JSONDecodeError:
-            pass
+            print(f"llm-notify: invalid stdin JSON (len={len(data)})", file=sys.stderr)
     return {}
 
 
@@ -72,7 +94,7 @@ def send_feishu(config, title, content):
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=10) as resp:
+    with urllib.request.urlopen(req, timeout=5) as resp:
         result = json.loads(resp.read().decode("utf-8"))
         if result.get("code", 0) != 0:
             print(f"飞书返回错误: {result}", file=sys.stderr)
@@ -85,14 +107,14 @@ def send_feishu(config, title, content):
 
 def save_prompt_time(session_id):
     os.makedirs(STATE_DIR, exist_ok=True)
-    path = os.path.join(STATE_DIR, session_id)
+    path = os.path.join(STATE_DIR, safe_state_name(session_id))
     with open(path, "w") as f:
         f.write(str(time.time()))
     cleanup_stale_state()
 
 
 def get_elapsed(session_id):
-    path = os.path.join(STATE_DIR, session_id)
+    path = os.path.join(STATE_DIR, safe_state_name(session_id))
     if not os.path.exists(path):
         return None
     try:
@@ -119,18 +141,22 @@ def cleanup_stale_state():
 
 def should_notify(config, session_id):
     min_dur = config.get("min_duration", 0)
-    if min_dur <= 0:
-        return True, None
     elapsed = get_elapsed(session_id)
+    if min_dur <= 0:
+        return True, elapsed
     if elapsed is None:
-        return True, None
+        return False, None
     return elapsed >= min_dur, elapsed
 
 
 def fmt_duration(seconds):
     if seconds is None:
         return ""
-    m, s = divmod(int(seconds), 60)
+    total = int(seconds)
+    h, remainder = divmod(total, 3600)
+    m, s = divmod(remainder, 60)
+    if h > 0:
+        return f"{h}小时{m}分{s}秒"
     if m > 0:
         return f"{m}分{s}秒"
     return f"{s}秒"
@@ -186,8 +212,12 @@ def cmd_test():
         f"状态: 连通性测试成功"
     )
     try:
-        send_feishu(config, title, content)
-        print("测试通知已发送，请检查飞书群")
+        ok = send_feishu(config, title, content)
+        if ok:
+            print("测试通知已发送，请检查飞书群")
+        else:
+            print("飞书返回错误，请检查 webhook 和 secret 配置", file=sys.stderr)
+            sys.exit(1)
     except Exception as e:
         print(f"发送失败: {e}", file=sys.stderr)
         sys.exit(1)
@@ -201,34 +231,26 @@ def cmd_install():
     print("1. Claude Code  (~/.claude/settings.json)")
     print("=" * 60)
     print()
-    print("在 hooks 对象中添加以下两项:")
+    print("在 hooks 对象的 UserPromptSubmit 数组中追加一项,")
+    print("并新增 Stop 数组:")
     print()
-    snippet = {
-        "UserPromptSubmit": [
-            "... (保留已有的 hook) ...",
-            {
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": f"{script} prompt-start",
-                        "timeout": 3,
-                    }
-                ]
-            },
-        ],
-        "Stop": [
-            {
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": f"{script} claude-stop",
-                        "timeout": 10,
-                    }
-                ]
-            }
-        ],
+    print("  UserPromptSubmit 追加:")
+    ups = {
+        "hooks": [
+            {"type": "command", "command": f"{script} prompt-start", "timeout": 3}
+        ]
     }
-    print(json.dumps(snippet, indent=2, ensure_ascii=False))
+    print(f"    {json.dumps(ups)}")
+    print()
+    print("  Stop 新增:")
+    stop = [
+        {
+            "hooks": [
+                {"type": "command", "command": f"{script} claude-stop", "timeout": 10}
+            ]
+        }
+    ]
+    print(f'    "Stop": {json.dumps(stop)}')
 
     print()
     print("=" * 60)
@@ -263,7 +285,7 @@ def cmd_install():
 
 def cmd_prompt_start():
     info = read_stdin_json()
-    session_id = info.get("session_id", "unknown")
+    session_id = extract_session_id(info)
     save_prompt_time(session_id)
 
 
@@ -271,7 +293,7 @@ def cmd_claude_stop():
     config = load_config()
     info = read_stdin_json()
 
-    session_id = info.get("session_id", "unknown")
+    session_id = extract_session_id(info)
     cwd = info.get("cwd", os.getcwd())
     transcript = info.get("transcript_summary", "")
 
@@ -296,16 +318,15 @@ def cmd_codex():
     info = {}
     if len(sys.argv) > 2:
         try:
-            info = json.loads(sys.argv[2])
+            info = json.loads(sys.argv[-1])
         except (json.JSONDecodeError, IndexError):
             pass
 
-    # Codex uses kebab-case field names
-    thread_id = info.get("thread-id", "unknown")
+    session_id = extract_session_id(info)
     cwd = info.get("cwd", os.getcwd())
     last_msg = info.get("last-assistant-message", "")
 
-    ok, elapsed = should_notify(config, thread_id)
+    ok, elapsed = should_notify(config, session_id)
     if not ok:
         return
 

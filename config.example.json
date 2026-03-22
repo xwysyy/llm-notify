@@ -1,0 +1,6 @@
+{
+  "webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+  "secret": "your-signing-secret",
+  "keyword": "[AI通知]",
+  "min_duration": 60
+}
