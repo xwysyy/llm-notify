@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+"""llm-notify: Feishu webhook notifier for Claude Code and Codex CLI."""
+
+import base64
+import hashlib
+import hmac
+import json
+import os
+import socket
+import sys
+import time
+import urllib.error
+import urllib.request
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
+STATE_DIR = os.path.join(SCRIPT_DIR, "state")
+
+
+# ─── Utilities ───
+
+
+def load_config():
+    if not os.path.exists(CONFIG_PATH):
+        print(f"配置文件不存在: {CONFIG_PATH}", file=sys.stderr)
+        print("请先运行: llm-notify init", file=sys.stderr)
+        sys.exit(1)
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def get_hostname():
+    return socket.gethostname()
+
+
+def read_stdin_json():
+    data = sys.stdin.read()
+    if data.strip():
+        try:
+            return json.loads(data)
+        except json.JSONDecodeError:
+            pass
+    return {}
+
+
+def send_feishu(config, title, content):
+    webhook = config["webhook"]
+    secret = config.get("secret", "")
+    keyword = config.get("keyword", "")
+
+    full_text = f"{title}\n{content}"
+    if keyword and keyword not in full_text:
+        title = f"{keyword} {title}"
+
+    body = {"msg_type": "text", "content": {"text": f"{title}\n{content}"}}
+
+    if secret:
+        timestamp = str(int(time.time()))
+        string_to_sign = f"{timestamp}\n{secret}"
+        hmac_code = hmac.new(
+            key=string_to_sign.encode("utf-8"),
+            msg=b"",
+            digestmod=hashlib.sha256,
+        ).digest()
+        body["timestamp"] = timestamp
+        body["sign"] = base64.b64encode(hmac_code).decode("utf-8")
+
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        webhook,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        result = json.loads(resp.read().decode("utf-8"))
+        if result.get("code", 0) != 0:
+            print(f"飞书返回错误: {result}", file=sys.stderr)
+            return False
+    return True
+
+
+# ─── Duration tracking ───
+
+
+def save_prompt_time(session_id):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    path = os.path.join(STATE_DIR, session_id)
+    with open(path, "w") as f:
+        f.write(str(time.time()))
+    cleanup_stale_state()
+
+
+def get_elapsed(session_id):
+    path = os.path.join(STATE_DIR, session_id)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r") as f:
+            start = float(f.read().strip())
+        os.unlink(path)
+        return time.time() - start
+    except (ValueError, OSError):
+        return None
+
+
+def cleanup_stale_state():
+    if not os.path.isdir(STATE_DIR):
+        return
+    cutoff = time.time() - 86400
+    try:
+        for name in os.listdir(STATE_DIR):
+            path = os.path.join(STATE_DIR, name)
+            if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                os.unlink(path)
+    except OSError:
+        pass
+
+
+def should_notify(config, session_id):
+    min_dur = config.get("min_duration", 0)
+    if min_dur <= 0:
+        return True, None
+    elapsed = get_elapsed(session_id)
+    if elapsed is None:
+        return True, None
+    return elapsed >= min_dur, elapsed
+
+
+def fmt_duration(seconds):
+    if seconds is None:
+        return ""
+    m, s = divmod(int(seconds), 60)
+    if m > 0:
+        return f"{m}分{s}秒"
+    return f"{s}秒"
+
+
+# ─── Subcommands ───
+
+
+def cmd_init():
+    print("=" * 50)
+    print("llm-notify 初始化 - 飞书 Webhook 配置")
+    print("=" * 50)
+    print()
+    print("飞书 Webhook 创建步骤:")
+    print("  1. 飞书(电脑端) → 创建一个群(可以只有自己)")
+    print("  2. 群设置 → 群机器人 → 添加机器人 → 自定义机器人")
+    print("  3. 安全设置选「签名校验」")
+    print("  4. 复制 Webhook URL 和 Secret")
+    print()
+
+    webhook = input("Webhook URL: ").strip()
+    if not webhook:
+        print("Webhook URL 不能为空", file=sys.stderr)
+        sys.exit(1)
+
+    secret = input("签名密钥 Secret (无则回车跳过): ").strip()
+    keyword = input("关键词, 如 [AI通知] (无则回车跳过): ").strip()
+
+    min_dur_str = input("最短通知时长(秒), 任务耗时低于此值不通知, 0=始终通知 [60]: ").strip()
+    min_dur = int(min_dur_str) if min_dur_str.isdigit() else 60
+
+    config = {"webhook": webhook, "min_duration": min_dur}
+    if secret:
+        config["secret"] = secret
+    if keyword:
+        config["keyword"] = keyword
+
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+
+    print(f"\n配置已写入: {CONFIG_PATH}")
+    print("下一步: llm-notify test")
+
+
+def cmd_test():
+    config = load_config()
+    title = config.get("keyword", "[AI通知]") or "[AI通知]"
+    content = (
+        f"测试通知\n"
+        f"机器: {get_hostname()}\n"
+        f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"最短通知时长: {config.get('min_duration', 0)}秒\n"
+        f"状态: 连通性测试成功"
+    )
+    try:
+        send_feishu(config, title, content)
+        print("测试通知已发送，请检查飞书群")
+    except Exception as e:
+        print(f"发送失败: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_install():
+    home = os.path.expanduser("~")
+    script = os.path.join(home, ".llm-notify", "llm-notify")
+
+    print("=" * 60)
+    print("1. Claude Code  (~/.claude/settings.json)")
+    print("=" * 60)
+    print()
+    print("在 hooks 对象中添加以下两项:")
+    print()
+    snippet = {
+        "UserPromptSubmit": [
+            "... (保留已有的 hook) ...",
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": f"{script} prompt-start",
+                        "timeout": 3,
+                    }
+                ]
+            },
+        ],
+        "Stop": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": f"{script} claude-stop",
+                        "timeout": 10,
+                    }
+                ]
+            }
+        ],
+    }
+    print(json.dumps(snippet, indent=2, ensure_ascii=False))
+
+    print()
+    print("=" * 60)
+    print("2. Codex CLI  (~/.codex/config.toml)")
+    print("=" * 60)
+    print()
+    print("顶层添加:")
+    print(f'  notify = ["{script}", "codex"]')
+    print()
+    print("[features] 中添加:")
+    print("  codex_hooks = true")
+    print()
+    print("然后创建 ~/.codex/hooks.json:")
+    codex_hooks = {
+        "hooks": {
+            "UserPromptSubmit": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": f"{script} prompt-start",
+                            "timeout": 3,
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+    print(json.dumps(codex_hooks, indent=2))
+    print()
+
+
+def cmd_prompt_start():
+    info = read_stdin_json()
+    session_id = info.get("session_id", "unknown")
+    save_prompt_time(session_id)
+
+
+def cmd_claude_stop():
+    config = load_config()
+    info = read_stdin_json()
+
+    session_id = info.get("session_id", "unknown")
+    cwd = info.get("cwd", os.getcwd())
+    transcript = info.get("transcript_summary", "")
+
+    ok, elapsed = should_notify(config, session_id)
+    if not ok:
+        return
+
+    title = config.get("keyword", "[AI通知]") or "[AI通知]"
+    lines = ["Claude Code 已完成", f"机器: {get_hostname()}", f"目录: {cwd}"]
+    if elapsed is not None:
+        lines.append(f"耗时: {fmt_duration(elapsed)}")
+    if transcript:
+        lines.append(f"摘要: {transcript[:200]}{'...' if len(transcript) > 200 else ''}")
+
+    send_feishu(config, title, "\n".join(lines))
+
+
+def cmd_codex():
+    config = load_config()
+
+    # Codex legacy notify: JSON as last argv argument
+    info = {}
+    if len(sys.argv) > 2:
+        try:
+            info = json.loads(sys.argv[2])
+        except (json.JSONDecodeError, IndexError):
+            pass
+
+    # Codex uses kebab-case field names
+    thread_id = info.get("thread-id", "unknown")
+    cwd = info.get("cwd", os.getcwd())
+    last_msg = info.get("last-assistant-message", "")
+
+    ok, elapsed = should_notify(config, thread_id)
+    if not ok:
+        return
+
+    title = config.get("keyword", "[AI通知]") or "[AI通知]"
+    lines = ["Codex 已完成", f"机器: {get_hostname()}", f"目录: {cwd}"]
+    if elapsed is not None:
+        lines.append(f"耗时: {fmt_duration(elapsed)}")
+    if last_msg:
+        lines.append(f"摘要: {last_msg[:200]}{'...' if len(last_msg) > 200 else ''}")
+
+    send_feishu(config, title, "\n".join(lines))
+
+
+COMMANDS = {
+    "init": cmd_init,
+    "test": cmd_test,
+    "install": cmd_install,
+    "prompt-start": cmd_prompt_start,
+    "claude-stop": cmd_claude_stop,
+    "codex": cmd_codex,
+}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        print(f"用法: llm-notify <子命令>")
+        print(f"子命令: {', '.join(COMMANDS.keys())}")
+        sys.exit(1)
+
+    subcmd = sys.argv[1]
+
+    # Hook subcommands: swallow all errors to never block the host tool
+    if subcmd in ("prompt-start", "claude-stop", "codex"):
+        try:
+            COMMANDS[subcmd]()
+        except BaseException as e:
+            print(f"llm-notify ({subcmd}): {e}", file=sys.stderr)
+            sys.exit(0)
+    else:
+        COMMANDS[subcmd]()
+
+
+if __name__ == "__main__":
+    main()
