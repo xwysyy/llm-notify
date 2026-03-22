@@ -295,7 +295,7 @@ def cmd_claude_stop():
 
     session_id = extract_session_id(info)
     cwd = info.get("cwd", os.getcwd())
-    transcript = info.get("transcript_summary", "")
+    transcript = info.get("last_assistant_message", "")
 
     ok, elapsed = should_notify(config, session_id)
     if not ok:
