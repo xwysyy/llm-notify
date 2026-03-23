@@ -1,4 +1,8 @@
 <p align="center">
+  <img src="./assets/llm-notify-banner-glass.svg" alt="llm-notify banner" />
+</p>
+
+<p align="center">
   <h1 align="center">llm-notify</h1>
   <p align="center">
     <b>Feishu webhook notifier for Claude Code & Codex CLI</b>

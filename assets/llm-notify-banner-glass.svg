@@ -1,0 +1,135 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="480" viewBox="0 0 1600 480" fill="none" role="img" aria-labelledby="title desc">
+<title>llm-notify banner</title>
+<desc>Banner design for llm-notify featuring a terminal notification logo and the project name.</desc>
+
+
+<defs>
+  <filter id="blur12" x="-30%" y="-30%" width="160%" height="160%">
+    <feGaussianBlur stdDeviation="12"/>
+  </filter>
+  <filter id="blur20" x="-30%" y="-30%" width="160%" height="160%">
+    <feGaussianBlur stdDeviation="20"/>
+  </filter>
+  <filter id="blur24" x="-30%" y="-30%" width="160%" height="160%">
+    <feGaussianBlur stdDeviation="24"/>
+  </filter>
+  <filter id="blur36" x="-40%" y="-40%" width="180%" height="180%">
+    <feGaussianBlur stdDeviation="36"/>
+  </filter>
+  <filter id="shadowSoft" x="-40%" y="-40%" width="180%" height="180%">
+    <feDropShadow dx="0" dy="18" stdDeviation="22" flood-color="#000000" flood-opacity="0.18"/>
+  </filter>
+  <linearGradient id="gradNeonText" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0%" stop-color="#ffffff"/>
+    <stop offset="52%" stop-color="#d7f0ff"/>
+    <stop offset="100%" stop-color="#8ce3ff"/>
+  </linearGradient>
+  <linearGradient id="gradNeonPlate" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0%" stop-color="#141b3a"/>
+    <stop offset="100%" stop-color="#0a0f22"/>
+  </linearGradient>
+  <linearGradient id="gradNeonBadge" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0%" stop-color="#7bf7ff"/>
+    <stop offset="100%" stop-color="#62a8ff"/>
+  </linearGradient>
+  <linearGradient id="gradTerminalPlate" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0%" stop-color="#0d1116"/>
+    <stop offset="100%" stop-color="#111920"/>
+  </linearGradient>
+  <linearGradient id="gradTerminalBadge" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0%" stop-color="#8dff8b"/>
+    <stop offset="100%" stop-color="#52d8ff"/>
+  </linearGradient>
+  <linearGradient id="gradGlassBg" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0%" stop-color="#fbfcff"/>
+    <stop offset="50%" stop-color="#f3f6ff"/>
+    <stop offset="100%" stop-color="#eef4ff"/>
+  </linearGradient>
+  <linearGradient id="gradGlassBadge" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0%" stop-color="#7c5cff"/>
+    <stop offset="100%" stop-color="#3fb8ff"/>
+  </linearGradient>
+  <linearGradient id="gradGlassPlate" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0%" stop-color="#ffffff"/>
+    <stop offset="100%" stop-color="#eef4ff"/>
+  </linearGradient>
+  <linearGradient id="gradMinimalAccent" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0%" stop-color="#101114"/>
+    <stop offset="100%" stop-color="#20283a"/>
+  </linearGradient>
+  <linearGradient id="gradOrbitBg" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0%" stop-color="#090b19"/>
+    <stop offset="50%" stop-color="#11152d"/>
+    <stop offset="100%" stop-color="#080912"/>
+  </linearGradient>
+  <linearGradient id="gradOrbitBadge" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0%" stop-color="#ff7bd5"/>
+    <stop offset="100%" stop-color="#8fd9ff"/>
+  </linearGradient>
+</defs>
+
+<rect width="1600" height="480" fill="url(#gradGlassBg)"/>
+<ellipse cx="220" cy="80" rx="180" ry="90" fill="#b8e8ff" opacity="0.55" filter="url(#blur36)"/>
+<ellipse cx="450" cy="360" rx="260" ry="120" fill="#d7c6ff" opacity="0.45" filter="url(#blur36)"/>
+<ellipse cx="1080" cy="100" rx="240" ry="100" fill="#d8d0ff" opacity="0.4" filter="url(#blur36)"/>
+<ellipse cx="1340" cy="320" rx="180" ry="90" fill="#a7f1ff" opacity="0.32" filter="url(#blur36)"/>
+<ellipse cx="900" cy="250" rx="220" ry="110" fill="#ffd9f1" opacity="0.22" filter="url(#blur36)"/>
+<rect x="18" y="18" width="1564" height="444" rx="34" stroke="rgba(255,255,255,0.55)" stroke-width="1.5" opacity="0.7"/>
+<rect x="72" y="76" width="1456" height="328" rx="36" fill="rgba(255,255,255,0.58)" stroke="rgba(255,255,255,0.82)" stroke-width="1.6" filter="url(#shadowSoft)"/>
+<path d="M 112 112 C 360 52, 652 66, 940 112" stroke="#ffffff" stroke-width="20" opacity="0.18" stroke-linecap="round"/>
+<path d="M 1176.27 204.43 A 104 104 0 0 0 1371.73 275.57" stroke="#8f90ff" stroke-width="2.5" stroke-linecap="round" opacity="0.3"/>
+<path d="M 1146.20 193.49 A 136 136 0 0 0 1401.80 286.51" stroke="#58d7ff" stroke-width="2" stroke-linecap="round" opacity="0.22"/>
+<circle cx="1274" cy="240" r="10" fill="#6a6aff" opacity="0.88"/>
+<circle cx="1274" cy="240" r="42" stroke="#8fa2ff" stroke-width="2" opacity="0.18"/>
+<rect x="1036" y="162" width="188" height="16" rx="8" fill="#7cc8ff" opacity="0.16"/>
+<rect x="1100" y="192" width="150" height="10" rx="5" fill="#6b79ff" opacity="0.14"/>
+<rect x="980" y="276" width="250" height="18" rx="9" fill="#ffffff" opacity="0.22"/>
+<rect x="1040" y="306" width="160" height="12" rx="6" fill="#6fdfff" opacity="0.13"/>
+<circle cx="1080" cy="120" r="1.5" fill="#6879b8" opacity="0.1"/>
+<circle cx="1080" cy="162" r="1.5" fill="#6879b8" opacity="0.1"/>
+<circle cx="1080" cy="204" r="1.5" fill="#6879b8" opacity="0.1"/>
+<circle cx="1080" cy="246" r="1.5" fill="#6879b8" opacity="0.1"/>
+<circle cx="1080" cy="288" r="1.5" fill="#6879b8" opacity="0.1"/>
+<circle cx="1132" cy="120" r="1.5" fill="#6879b8" opacity="0.1"/>
+<circle cx="1132" cy="162" r="1.5" fill="#6879b8" opacity="0.1"/>
+<circle cx="1132" cy="204" r="1.5" fill="#6879b8" opacity="0.1"/>
+<circle cx="1132" cy="246" r="1.5" fill="#6879b8" opacity="0.1"/>
+<circle cx="1132" cy="288" r="1.5" fill="#6879b8" opacity="0.1"/>
+<circle cx="1184" cy="120" r="1.5" fill="#6879b8" opacity="0.1"/>
+<circle cx="1184" cy="162" r="1.5" fill="#6879b8" opacity="0.1"/>
+<circle cx="1184" cy="204" r="1.5" fill="#6879b8" opacity="0.1"/>
+<circle cx="1184" cy="246" r="1.5" fill="#6879b8" opacity="0.1"/>
+<circle cx="1184" cy="288" r="1.5" fill="#6879b8" opacity="0.1"/>
+<circle cx="1236" cy="120" r="1.5" fill="#6879b8" opacity="0.1"/>
+<circle cx="1236" cy="162" r="1.5" fill="#6879b8" opacity="0.1"/>
+<circle cx="1236" cy="204" r="1.5" fill="#6879b8" opacity="0.1"/>
+<circle cx="1236" cy="246" r="1.5" fill="#6879b8" opacity="0.1"/>
+<circle cx="1236" cy="288" r="1.5" fill="#6879b8" opacity="0.1"/>
+<circle cx="1288" cy="120" r="1.5" fill="#6879b8" opacity="0.1"/>
+<circle cx="1288" cy="162" r="1.5" fill="#6879b8" opacity="0.1"/>
+<circle cx="1288" cy="204" r="1.5" fill="#6879b8" opacity="0.1"/>
+<circle cx="1288" cy="246" r="1.5" fill="#6879b8" opacity="0.1"/>
+<circle cx="1288" cy="288" r="1.5" fill="#6879b8" opacity="0.1"/>
+<rect x="160" y="150" width="180" height="180" rx="43.199999999999996" fill="#131c35" stroke="rgba(255,255,255,0.18)" stroke-width="2"/>
+<path d="M 181.6 171.6 C 228.4 153.6, 286.0 160.8, 318.4 182.4" stroke="#cfe7ff" stroke-width="10.799999999999999" stroke-linecap="round" opacity="0.12"/>
+<rect x="190.6" y="193.2" width="90.0" height="64.8" rx="16.2" fill="rgba(255,255,255,0.04)" stroke="rgba(152,224,255,0.32)" stroke-width="3.2399999999999998"/>
+<line x1="190.6" y1="209.39999999999998" x2="280.6" y2="209.39999999999998" stroke="#8fe0ff" stroke-width="3.2399999999999998" opacity="0.65"/>
+<circle cx="200.5" cy="203.1" r="3.2399999999999998" fill="#8fe0ff" opacity="0.45"/>
+<circle cx="209.5" cy="203.1" r="3.2399999999999998" fill="#8fe0ff" opacity="0.75"/>
+<circle cx="218.5" cy="203.1" r="3.2399999999999998" fill="#8fe0ff" opacity="0.55"/>
+<path d="M 214.0 228.83999999999997 L 224.8 235.968 L 214.0 243.74399999999997" stroke="#ffffff" stroke-width="8.1" stroke-linecap="round" stroke-linejoin="round"/>
+<line x1="234.7" y1="239.856" x2="255.39999999999998" y2="239.856" stroke="#ffffff" stroke-width="6.84" stroke-linecap="round" opacity="0.95"/>
+<circle cx="293.2" cy="204.0" r="44.37" fill="#8d83ff" opacity="0.24" filter="url(#blur20)"/>
+<circle cx="293.2" cy="204.0" r="30.6" fill="url(#gradGlassBadge)" stroke="rgba(255,255,255,0.45)" stroke-width="2.88"/>
+<circle cx="293.2" cy="204.0" r="37.944" stroke="#88d5ff" stroke-width="2.16" opacity="0.24"/>
+<path d="M 280.348 204.612 L 290.14 214.404 L 306.96999999999997 194.82" stroke="#f9fbff" stroke-width="9.0" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M 316.15 171.87 A 42.228 42.228 0 0 1 334.816 199.104" stroke="#9ad9ff" stroke-width="3.2399999999999998" stroke-linecap="round" opacity="0.75"/>
+<path d="M 322.57599999999996 160.548 A 56.916000000000004 56.916000000000004 0 0 1 349.504 197.268" stroke="#9ad9ff" stroke-width="2.52" stroke-linecap="round" opacity="0.42"/>
+<path d="M 192.4 285.0 C 224.8 297.6, 257.2 297.6, 282.4 286.8" stroke="#78d2ff" stroke-width="2.88" opacity="0.22" stroke-linecap="round"/>
+<text x="398" y="259" fill="rgba(37,52,91,0.12)" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="96" font-weight="820" letter-spacing="-2">llm-notify</text>
+<text x="392" y="252" fill="#14203d" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="96" font-weight="820" letter-spacing="-2">llm-notify</text>
+<path d="M 394 296 C 492 282, 610 312, 736 300 S 972 284, 1090 298" stroke="#7f9bff" stroke-width="3" opacity="0.18" stroke-linecap="round"/>
+<rect x="398" y="314" width="118" height="10" rx="5" fill="#6d8cff" opacity="0.24"/>
+<rect x="536" y="314" width="88" height="10" rx="5" fill="#7ed9ff" opacity="0.24"/>
+<rect x="644" y="314" width="130" height="10" rx="5" fill="#ffffff" opacity="0.38"/>
+</svg>
