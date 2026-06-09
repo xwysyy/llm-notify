@@ -5,50 +5,46 @@
 <p align="center">
   <h1 align="center">llm-notify</h1>
   <p align="center">
-    <b>Feishu webhook notifier for Claude Code & Codex CLI</b>
+    <b>Feishu task receipts for Claude Code & Codex CLI</b>
   </p>
   <p align="center">
     <a href="./README_CN.md">中文文档</a> &nbsp;|&nbsp; English
-  </p>
-  <p align="center">
-    <img src="https://img.shields.io/badge/python-3.6+-blue?logo=python&logoColor=white" alt="Python 3.6+">
-    <img src="https://img.shields.io/badge/dependencies-zero-brightgreen" alt="Zero Dependencies">
-    <img src="https://img.shields.io/badge/Claude_Code-hook-blueviolet?logo=anthropic" alt="Claude Code">
-    <img src="https://img.shields.io/badge/Codex_CLI-notify-orange?logo=openai" alt="Codex CLI">
-    <img src="https://img.shields.io/github/license/xwysyy/llm-notify" alt="License">
   </p>
 </p>
 
 ---
 
-AI coding tasks can run for minutes. Stop watching the terminal — get a **Feishu (飞书)** notification when the job is done.
+`llm-notify` sends a Feishu receipt when Claude Code or Codex finishes a task. Normal completion uses the latest human input time to decide whether you are likely away.
 
-## Highlights
+Core rule: normal completion is gated by user idle state; failures, explicit notify requests, and user-input waiting events notify immediately.
 
-- **Single file, zero dependencies** — Python 3 stdlib only, nothing to install
-- **Dual support** — works with both [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [Codex CLI](https://github.com/openai/codex)
-- **Smart filtering** — only notify when a task exceeds a configurable duration (e.g. 60s)
-- **Secure** — HMAC-SHA256 signature verification for Feishu webhooks
-- **Portable** — self-contained in `~/.llm-notify/`, `scp` to any server and go
+## Features
+
+- **Away receipts**: normal completion can notify once 300 seconds pass with no human input.
+- **Pending delivery**: completion while you are still active is delayed; continuing the same session cancels it, stopping input sends it later.
+- **Immediate required alerts**: StopFailure, Claude idle prompts, explicit notify requests, and failed tasks bypass the idle gate.
+- **Privacy-first content**: no prompt, assistant response, command text, command output, or diff is sent by default.
+- **Single file, zero dependencies**: Python 3 standard library and Feishu custom webhook.
 
 ## How It Works
 
-```
-                          ┌──────────────────────────────┐
-  User sends prompt ────► │  UserPromptSubmit hook        │
-                          │  prompt-start: save timestamp │
-                          └──────────────────────────────┘
-                                       ...
-                                  (AI working)
-                                       ...
-                          ┌──────────────────────────────┐
-  Task completes ───────► │  Stop hook / notify           │
-                          │  claude-stop / codex          │
-                          │                               │
-                          │  elapsed > min_duration?      │
-                          │    yes ──► Feishu webhook     │
-                          │     no ──► skip               │
-                          └──────────────────────────────┘
+```text
+UserPromptSubmit
+  records latest human input time
+  records task state and Git baseline
+
+PostToolUse / PostToolUseFailure
+  records tool count, failure count, and safe file path candidates
+
+Stop
+  normal completion path
+  sends immediately if the user is away
+  writes pending and spawns one-shot pending-check if the user is active
+
+pending-check
+  cancels if the same session continues
+  defers if another session receives input
+  sends when idle_window expires with no new input
 ```
 
 ## Quick Start
@@ -62,161 +58,155 @@ chmod +x ~/.llm-notify/llm-notify
 
 ### 2. Create a Feishu Webhook
 
-> Requires the Feishu **desktop app** (not mobile).
+Use the Feishu desktop app.
 
-1. Create a group chat (can be just yourself)
-2. **Group Settings** → **Bots** → **Add Bot** → **Custom Bot**
-3. Security: select **Sign Verification**
-4. Copy the **Webhook URL** and **Secret**
+1. Create a group chat.
+2. Open group settings -> bots -> add bot -> custom bot.
+3. Enable signature verification.
+4. Copy the Webhook URL and Secret.
 
-### 3. Configure
+### 3. Initialize Config
 
 ```bash
 ~/.llm-notify/llm-notify init
 ```
 
-You'll be prompted for: Webhook URL, Secret, keyword, and minimum duration.
-
-### 4. Verify
+### 4. Test Connectivity
 
 ```bash
 ~/.llm-notify/llm-notify test
 ```
 
-### 5. Hook into Your Tools
+### 5. Install Hooks
 
 ```bash
 ~/.llm-notify/llm-notify install
 ```
 
-This prints config snippets — apply them as described below.
+The command prints Claude Code and Codex hook snippets.
 
-## Integration
+## Configuration
+
+`~/.llm-notify/config.json`:
+
+```json
+{
+  "webhook": "https://open.feishu.cn/open-apis/bot/.../xxxxxxxx",
+  "secret": "your-secret",
+  "keyword": "[AI通知]",
+  "machine_label": "autodl-box",
+  "activity": {
+    "idle_window": 300
+  },
+  "content": {
+    "max_changed_files": 10,
+    "path_mode": "project",
+    "include_privacy_note": true
+  }
+}
+```
+
+| Field | Description |
+|:------|:------------|
+| `webhook` | Feishu custom bot webhook URL |
+| `secret` | Optional signing secret |
+| `keyword` | Keyword prefix for Feishu keyword verification |
+| `machine_label` | Label shown in receipts instead of the real hostname |
+| `activity.idle_window` | Idle seconds required to treat the user as away |
+| `content.max_changed_files` | Maximum changed files to show |
+| `content.path_mode` | `project` shows project name and relative paths |
+| `content.include_privacy_note` | Whether to include the privacy note |
+
+Normal completion is controlled by `idle_window` and pending state.
+
+## Hook Setup
 
 ### Claude Code
 
-Add to `~/.claude/settings.json` under `"hooks"`:
+Add `llm-notify event claude` to these events in `~/.claude/settings.json`:
 
-```jsonc
-{
-  "hooks": {
-    // ... your existing hooks ...
-    "UserPromptSubmit": [
-      // ... your existing entries ...
-      {
-        "hooks": [{
-          "type": "command",
-          "command": "~/.llm-notify/llm-notify prompt-start",
-          "timeout": 3
-        }]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [{
-          "type": "command",
-          "command": "~/.llm-notify/llm-notify claude-stop",
-          "timeout": 10
-        }]
-      }
-    ]
-  }
-}
+```text
+UserPromptSubmit
+PostToolUse
+PostToolUseFailure
+Notification
+StopFailure
+Stop
 ```
+
+Run `llm-notify install` for the full JSON snippet.
 
 ### Codex CLI
 
-**`~/.codex/config.toml`** :
+Add `llm-notify event codex` to these events in `~/.codex/hooks.json`:
+
+```text
+UserPromptSubmit
+PostToolUse
+Stop
+```
+
+`UserPromptSubmit` records the latest human input, `Stop` handles normal completion receipts, and `PostToolUse` records tool counts, failure counts, and file path candidates. Permission approval events stay silent.
+
+Codex hooks are usually enabled by default. If hooks were explicitly disabled, set:
 
 ```toml
-# Top level
-notify = ["~/.llm-notify/llm-notify", "codex"]
-
-# Enable hooks feature (for duration filtering)
 [features]
-codex_hooks = true
+hooks = true
 ```
 
-**`~/.codex/hooks.json`** (create this file):
+Run `/hooks` in Codex to review and trust the command hooks.
 
-```json
-{
-  "hooks": {
-    "UserPromptSubmit": [
-      {
-        "hooks": [{
-          "type": "command",
-          "command": "~/.llm-notify/llm-notify prompt-start",
-          "timeout": 3
-        }]
-      }
-    ]
-  }
-}
+## Notification Example
+
+```text
+[AI通知] Codex 任务完成
+工具: Codex
+机器: autodl-box
+项目: llm-notify
+耗时: 6分18秒
+触发: 离开后补发
+改动文件:
+- llm-notify
+- README.md
+备注: 任务开始前已有脏文件 1 个
+执行: 工具 5 次，失败 0 次
+隐私: 未发送 prompt、回复正文、命令输出、diff 内容
 ```
 
-> **Note:** `notify` handles task completion; `hooks.json` records start time for duration filtering.
-> If `codex_hooks` is unavailable in your Codex version, notifications still work — just without duration filtering.
+## Commands
 
-## Configuration Reference
+| Command | Description |
+|:--------|:------------|
+| `init` | Create config interactively |
+| `test` | Send a Feishu connectivity test |
+| `install` | Print Claude Code and Codex hook snippets |
+| `event` | Hook entrypoint, reads JSON from stdin |
+| `pending-check <pending_id>` | One-shot pending delivery check |
 
-`~/.llm-notify/config.json` (generated by `init`):
+## Privacy
 
-```json
-{
-  "webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx",
-  "secret": "your-secret",
-  "keyword": "[AI通知]",
-  "min_duration": 60
-}
-```
+Feishu messages use metadata only and exclude:
 
-| Field | Required | Default | Description |
-|:------|:--------:|:-------:|:------------|
-| `webhook` | Yes | — | Feishu custom bot webhook URL |
-| `secret` | No | — | HMAC-SHA256 signing secret |
-| `keyword` | No | — | Auto-prepended to messages (for keyword-based bot security) |
-| `min_duration` | No | `0` | Minimum task duration (seconds) to trigger a notification. `0` = always notify |
+- User prompt.
+- Assistant final response.
+- Codex input messages.
+- Command text.
+- stdout / stderr.
+- patch / diff.
+- Full absolute cwd.
+- Real hostname.
 
-## Notification Preview
-
-```
-[AI通知]
-Claude Code 已完成
-机器: my-server
-目录: /home/user/project
-耗时: 3分42秒
-摘要: Refactored the authentication module, updated 5 files...
-```
-
-## CLI Reference
-
-| Subcommand | Invoked by | Description |
-|:-----------|:-----------|:------------|
-| `init` | User | Interactive setup → writes `config.json` |
-| `test` | User | Send a test notification |
-| `install` | User | Print hook config snippets for Claude Code & Codex |
-| `prompt-start` | `UserPromptSubmit` hook | Record task start timestamp |
-| `claude-stop` | Claude Code `Stop` hook | Evaluate duration & send notification (stdin JSON) |
-| `codex` | Codex `notify` | Evaluate duration & send notification (argv JSON) |
-
-## Multi-Server Deploy
-
-```bash
-scp -r ~/.llm-notify/ user@new-server:~/.llm-notify/
-ssh user@new-server '~/.llm-notify/llm-notify test'
-# Then configure hooks on the new server
-```
-
-Each notification includes the **machine hostname**, so you always know which server finished.
+Receipts only use allowlisted metadata: tool, machine label, project name, duration, trigger reason, relative changed file paths, tool count, and failure count.
 
 ## Troubleshooting
 
-| Symptom | Fix |
-|:--------|:----|
-| No notification received | Run `llm-notify test` to verify connectivity. Check `min_duration` isn't filtering short tasks. |
-| Hook blocking Claude / Codex | Should never happen — all hook errors are caught and exit 0. Check: `echo '{}' \| llm-notify claude-stop 2>&1` |
-| Duration filter not working (Codex) | Ensure `codex_hooks = true` in `[features]` and `~/.codex/hooks.json` exists. |
+| Symptom | Check |
+|:--------|:------|
+| No normal completion receipt | The task may still be inside `idle_window`; pending sends when the away window expires |
+| Codex hook missing | Run `/hooks` review/trust and confirm hooks are enabled |
+| No summary appears | Messages use metadata only |
+| Changed files look incomplete | Git status is a worktree hint, not an audit trail; non-Git directories are best-effort |
 
 ## Requirements
 

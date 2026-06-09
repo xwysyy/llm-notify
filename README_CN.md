@@ -5,50 +5,46 @@
 <p align="center">
   <h1 align="center">llm-notify</h1>
   <p align="center">
-    <b>Claude Code & Codex CLI 飞书通知器</b>
+    <b>Claude Code & Codex CLI 飞书任务回执</b>
   </p>
   <p align="center">
     中文文档 &nbsp;|&nbsp; <a href="./README.md">English</a>
-  </p>
-  <p align="center">
-    <img src="https://img.shields.io/badge/python-3.6+-blue?logo=python&logoColor=white" alt="Python 3.6+">
-    <img src="https://img.shields.io/badge/依赖-零-brightgreen" alt="零依赖">
-    <img src="https://img.shields.io/badge/Claude_Code-hook-blueviolet?logo=anthropic" alt="Claude Code">
-    <img src="https://img.shields.io/badge/Codex_CLI-notify-orange?logo=openai" alt="Codex CLI">
-    <img src="https://img.shields.io/github/license/xwysyy/llm-notify" alt="License">
   </p>
 </p>
 
 ---
 
-AI 编程任务动辄几分钟，不必守着终端干等——任务完成后自动收到**飞书通知**。
+`llm-notify` 在 Claude Code 或 Codex 任务结束后发送飞书回执。普通完成根据最近一次人工输入判断你是否已经离开。
+
+核心规则：普通完成看用户是否离开；失败、显式通知请求和等待用户输入的事件立即通知。
 
 ## 特性
 
-- **单文件，零依赖** — 纯 Python 3 标准库，无需 pip install
-- **双端支持** — 同时兼容 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) 和 [Codex CLI](https://github.com/openai/codex)
-- **智能过滤** — 仅在任务耗时超过设定阈值（如 60 秒）时通知，避免刷屏
-- **安全签名** — 支持飞书 HMAC-SHA256 签名校验
-- **即拿即用** — 整个工具在 `~/.llm-notify/` 目录内自包含，`scp` 到新服务器即可运行
+- **离开后回执**：默认最后一次输入 300 秒后视为离开，任务完成才通知。
+- **pending 补发**：你还在输入时普通完成先挂起；继续同一会话则取消，停止输入后补发。
+- **必要事件立即通知**：StopFailure、Claude idle 提醒、显式通知请求和失败任务绕过 idle gate。
+- **隐私优先**：默认不发送 prompt、模型回复、命令内容、命令输出、diff。
+- **单文件零依赖**：纯 Python 3 标准库，使用飞书自定义机器人 webhook。
 
 ## 工作原理
 
-```
-                          ┌──────────────────────────────┐
-  用户发送提示词 ────────► │  UserPromptSubmit hook        │
-                          │  prompt-start: 记录时间戳     │
-                          └──────────────────────────────┘
-                                       ...
-                                  （AI 工作中）
-                                       ...
-                          ┌──────────────────────────────┐
-  任务完成 ─────────────► │  Stop hook / notify           │
-                          │  claude-stop / codex          │
-                          │                               │
-                          │  耗时 > min_duration ?        │
-                          │    是 ──► 飞书 webhook 通知   │
-                          │    否 ──► 跳过                │
-                          └──────────────────────────────┘
+```text
+UserPromptSubmit
+  记录最近人工输入时间
+  记录任务状态和 Git baseline
+
+PostToolUse / PostToolUseFailure
+  只记录工具次数、失败次数、文件路径候选
+
+Stop
+  普通完成入口
+  如果用户已离开，立即发飞书
+  如果用户仍活跃，写 pending 并派生一次性 pending-check
+
+pending-check
+  同一 session 继续输入则取消
+  其他 session 输入则顺延
+  没有新输入直到 idle_window 到期则补发
 ```
 
 ## 快速开始
@@ -62,12 +58,12 @@ chmod +x ~/.llm-notify/llm-notify
 
 ### 2. 创建飞书 Webhook
 
-> 需要使用飞书**电脑端**（手机端无此入口）。
+需要使用飞书电脑端。
 
-1. 创建一个群聊（可以只有你自己）
-2. **群设置** → **群机器人** → **添加机器人** → **自定义机器人**
-3. 安全设置选择**签名校验**
-4. 复制 **Webhook URL** 和 **Secret**
+1. 创建一个群聊，可以只有你自己。
+2. 群设置 -> 群机器人 -> 添加机器人 -> 自定义机器人。
+3. 安全设置选择签名校验。
+4. 复制 Webhook URL 和 Secret。
 
 ### 3. 初始化配置
 
@@ -75,7 +71,7 @@ chmod +x ~/.llm-notify/llm-notify
 ~/.llm-notify/llm-notify init
 ```
 
-按提示输入：Webhook URL、签名密钥、关键词、最短通知时长。
+按提示输入 Webhook URL、Secret、关键词、机器标签和 idle window。
 
 ### 4. 验证连通性
 
@@ -83,147 +79,141 @@ chmod +x ~/.llm-notify/llm-notify
 ~/.llm-notify/llm-notify test
 ```
 
-检查飞书群是否收到测试消息。
-
 ### 5. 接入 Claude Code / Codex
 
 ```bash
 ~/.llm-notify/llm-notify install
 ```
 
-会打印配置片段，按下方说明手动合并到对应配置文件中。
+命令会打印 Claude Code 与 Codex 的 hooks 配置片段。
 
-## 接入配置
+## 配置
+
+`~/.llm-notify/config.json`：
+
+```json
+{
+  "webhook": "https://open.feishu.cn/open-apis/bot/.../xxxxxxxx",
+  "secret": "your-secret",
+  "keyword": "[AI通知]",
+  "machine_label": "autodl-box",
+  "activity": {
+    "idle_window": 300
+  },
+  "content": {
+    "max_changed_files": 10,
+    "path_mode": "project",
+    "include_privacy_note": true
+  }
+}
+```
+
+| 字段 | 说明 |
+|:-----|:-----|
+| `webhook` | 飞书自定义机器人 Webhook 地址 |
+| `secret` | 签名校验密钥，可为空 |
+| `keyword` | 飞书关键词安全校验用前缀 |
+| `machine_label` | 通知里的机器标签，不使用真实 hostname |
+| `activity.idle_window` | 最近一次人工输入后多少秒视为离开，默认 300 |
+| `content.max_changed_files` | 通知最多展示多少个改动文件 |
+| `content.path_mode` | 使用 `project` 时显示项目名和相对路径 |
+| `content.include_privacy_note` | 是否显示隐私说明 |
+
+普通完成由 `idle_window` 和 pending 状态决定。配置中的 `min_duration` 不参与普通完成通知判断。
+
+## Hook 配置
 
 ### Claude Code
 
-在 `~/.claude/settings.json` 的 `"hooks"` 对象中添加：
+在 `~/.claude/settings.json` 的 `hooks` 中添加 `llm-notify event claude`。推荐事件：
 
-```jsonc
-{
-  "hooks": {
-    // ... 已有的 hooks ...
-    "UserPromptSubmit": [
-      // ... 已有的条目 ...
-      {
-        "hooks": [{
-          "type": "command",
-          "command": "~/.llm-notify/llm-notify prompt-start",
-          "timeout": 3
-        }]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [{
-          "type": "command",
-          "command": "~/.llm-notify/llm-notify claude-stop",
-          "timeout": 10
-        }]
-      }
-    ]
-  }
-}
+```text
+UserPromptSubmit
+PostToolUse
+PostToolUseFailure
+Notification
+StopFailure
+Stop
 ```
+
+`llm-notify install` 会打印完整 JSON 片段。
 
 ### Codex CLI
 
-**`~/.codex/config.toml`** ：
+在 `~/.codex/hooks.json` 中添加 `llm-notify event codex`。推荐事件：
+
+```text
+UserPromptSubmit
+PostToolUse
+Stop
+```
+
+`UserPromptSubmit` 记录最近人工输入，`Stop` 处理普通完成回执，`PostToolUse` 记录工具次数、失败次数和文件路径候选。权限审批事件保持静默。
+
+Codex hooks 通常默认启用。如果你显式关闭过 hooks，可在 `~/.codex/config.toml` 设置：
 
 ```toml
-# 顶层添加
-notify = ["~/.llm-notify/llm-notify", "codex"]
-
-# 启用 hooks 功能（用于耗时过滤）
 [features]
-codex_hooks = true
+hooks = true
 ```
 
-**`~/.codex/hooks.json`**（新建此文件）：
+Codex 中需要运行 `/hooks` review/trust 这些命令 hook。
 
-```json
-{
-  "hooks": {
-    "UserPromptSubmit": [
-      {
-        "hooks": [{
-          "type": "command",
-          "command": "~/.llm-notify/llm-notify prompt-start",
-          "timeout": 3
-        }]
-      }
-    ]
-  }
-}
+## 通知示例
+
+```text
+[AI通知] Codex 任务完成
+工具: Codex
+机器: autodl-box
+项目: llm-notify
+耗时: 6分18秒
+触发: 离开后补发
+改动文件:
+- llm-notify
+- README_CN.md
+备注: 任务开始前已有脏文件 1 个
+执行: 工具 5 次，失败 0 次
+隐私: 未发送 prompt、回复正文、命令输出、diff 内容
 ```
 
-> **说明：** `notify` 负责任务完成时触发通知；`hooks.json` 负责记录开始时间以支持耗时过滤。
-> 如果你的 Codex 版本不支持 `codex_hooks` 功能，通知仍然正常工作，只是无法过滤短任务。
+## 命令
 
-## 配置说明
+| 子命令 | 说明 |
+|:-------|:-----|
+| `init` | 交互式生成配置 |
+| `test` | 发送飞书连通性测试 |
+| `install` | 打印 Claude Code / Codex hooks 配置片段 |
+| `event` | hook 统一入口，从 stdin 读取 JSON |
+| `pending-check <pending_id>` | 一次性 pending 补发检查 |
 
-`~/.llm-notify/config.json`（由 `init` 命令生成）：
+## 隐私策略
 
-```json
-{
-  "webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx",
-  "secret": "your-secret",
-  "keyword": "[AI通知]",
-  "min_duration": 60
-}
-```
+默认不会发送：
 
-| 字段 | 必填 | 默认值 | 说明 |
-|:-----|:----:|:------:|:-----|
-| `webhook` | 是 | — | 飞书自定义机器人 Webhook 地址 |
-| `secret` | 否 | — | 签名校验密钥 |
-| `keyword` | 否 | — | 消息中不含该关键词时自动前缀（用于关键词安全校验） |
-| `min_duration` | 否 | `0` | 最短通知时长（秒），任务耗时低于此值不通知。`0` = 始终通知 |
+- 用户 prompt。
+- 模型最终回复。
+- Codex input messages。
+- 命令文本。
+- stdout / stderr。
+- patch / diff。
+- 完整绝对路径。
+- 真实 hostname。
 
-## 通知效果
-
-```
-[AI通知]
-Claude Code 已完成
-机器: my-server
-目录: /home/user/project
-耗时: 3分42秒
-摘要: Refactored the authentication module, updated 5 files...
-```
-
-## 命令一览
-
-| 子命令 | 触发方 | 说明 |
-|:-------|:-------|:-----|
-| `init` | 用户手动 | 交互式配置 → 生成 `config.json` |
-| `test` | 用户手动 | 发送测试通知 |
-| `install` | 用户手动 | 打印 Claude Code / Codex 的 hook 配置片段 |
-| `prompt-start` | `UserPromptSubmit` hook | 记录任务开始时间戳 |
-| `claude-stop` | Claude Code `Stop` hook | 判断耗时 & 发送通知（stdin JSON） |
-| `codex` | Codex `notify` | 判断耗时 & 发送通知（argv JSON） |
-
-## 多服务器部署
-
-```bash
-scp -r ~/.llm-notify/ user@new-server:~/.llm-notify/
-ssh user@new-server '~/.llm-notify/llm-notify test'
-# 然后在新服务器上配置 hooks
-```
-
-每条通知都包含**机器名**，多台服务器同时使用也能一眼看出是哪台完成的。
+通知只使用 allowlist 元数据：工具、机器标签、项目名、耗时、触发原因、改动文件相对路径、工具次数、失败次数。
 
 ## 常见问题
 
 | 现象 | 排查方法 |
 |:-----|:---------|
-| 收不到通知 | 运行 `llm-notify test` 验证连通性；检查 `min_duration` 是否过滤了短任务 |
-| Hook 阻塞了 Claude / Codex | 理论上不会发生——所有 hook 子命令捕获全部异常并 exit 0。诊断：`echo '{}' \| llm-notify claude-stop 2>&1` |
-| Codex 耗时过滤不生效 | 确认 `config.toml` 中 `[features]` 有 `codex_hooks = true`，且 `~/.codex/hooks.json` 已创建 |
+| 收不到普通完成通知 | 检查是否仍在 `idle_window` 内；pending 会在离开窗口后补发 |
+| Codex hook 未触发 | 运行 `/hooks` review/trust，并确认 hooks 未被禁用 |
+| 通知里没有摘要 | 默认不发送模型回复，避免泄露会话内容 |
+| 改动文件不完整 | Git status 是工作区提示，不是严格审计；非 Git 目录只做 best-effort |
 
 ## 环境要求
 
 - Python 3.6+
-- 能访问 `open.feishu.cn` 的网络环境
+- 能访问 `open.feishu.cn`
 
 ## 许可证
 
