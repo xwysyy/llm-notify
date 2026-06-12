@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""llm-notify v2: Feishu receipts for Claude Code and Codex CLI."""
+"""llm-notify v3: presence-gated Feishu receipts for Claude Code and Codex CLI.
+
+Decision model: never disturb a present user, tell an absent user
+immediately, never resend what the user has already seen.
+"""
 
 import base64
 import hashlib
@@ -7,17 +11,26 @@ import hmac
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
 import urllib.request
 
+try:
+    import fcntl
+except ImportError:  # non-POSIX; watcher locking degrades to spawn-per-event
+    fcntl = None
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
-STATE_DIR = os.path.join(SCRIPT_DIR, "state")
-ACTIVITY_PATH = os.path.join(STATE_DIR, "activity.json")
-TURNS_DIR = os.path.join(STATE_DIR, "turns")
-PENDING_DIR = os.path.join(STATE_DIR, "pending")
+CONFIG_PATH = os.environ.get("LLM_NOTIFY_CONFIG") or os.path.join(SCRIPT_DIR, "config.json")
+STATE_DIR = os.environ.get("LLM_NOTIFY_STATE_DIR") or os.path.join(SCRIPT_DIR, "state")
+SESSIONS_DIR = os.path.join(STATE_DIR, "sessions")
+QUEUE_DIR = os.path.join(STATE_DIR, "queue")
+PRESENCE_PATH = os.path.join(STATE_DIR, "presence.json")
+WIN_IDLE_CACHE = os.path.join(STATE_DIR, "win_idle.json")
+LOG_PATH = os.path.join(STATE_DIR, "log.jsonl")
+WATCHER_LOCK = os.path.join(STATE_DIR, "watcher.lock")
 
 SAFE_ID_RE = re.compile(r"[^a-zA-Z0-9_.@+-]")
 SENSITIVE_WORD_RE = re.compile(
@@ -42,7 +55,30 @@ EXPLICIT_NOTIFY_RE = re.compile(
     re.IGNORECASE,
 )
 
-HOOK_COMMANDS = {"event", "pending-check"}
+INTERVENTION_TYPES = {
+    "permission_prompt": "权限确认",
+    "elicitation_dialog": "MCP 交互确认",
+}
+
+EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+
+WATCH_POLL = max(1, int(os.environ.get("LLM_NOTIFY_POLL") or 30))
+WIN_IDLE_CACHE_TTL = 15
+WIN_IDLE_PS = (
+    "Add-Type 'using System;using System.Runtime.InteropServices;"
+    "public class LNIdle{"
+    "[DllImport(\"user32.dll\")]public static extern bool GetLastInputInfo(ref LNLast l);"
+    "[StructLayout(LayoutKind.Sequential)]public struct LNLast{public uint cbSize;public uint dwTime;}"
+    "public static uint Get(){LNLast l=new LNLast();"
+    "l.cbSize=(uint)Marshal.SizeOf(typeof(LNLast));GetLastInputInfo(ref l);"
+    "return ((uint)Environment.TickCount-l.dwTime)/1000u;}}'"
+    ";[LNIdle]::Get()"
+)
+
+LOG_MAX_BYTES = 1024 * 1024
+LOG_KEEP_LINES = 2000
+SESSION_GC_AGE = 7 * 86400
+GIT_STATUS_CAP = 5000
 
 
 def now_ts():
@@ -55,7 +91,7 @@ def safe_state_name(value):
 
 
 def ensure_state_dirs():
-    for path in (STATE_DIR, TURNS_DIR, PENDING_DIR):
+    for path in (STATE_DIR, SESSIONS_DIR, QUEUE_DIR):
         os.makedirs(path, mode=0o700, exist_ok=True)
         try:
             os.chmod(path, 0o700)
@@ -99,13 +135,35 @@ def read_stdin_json():
         return {}
 
 
+def log_decision(decision, **fields):
+    ensure_state_dirs()
+    record = {"ts": round(now_ts(), 3), "decision": decision}
+    record.update(fields)
+    line = json.dumps(record, ensure_ascii=False, sort_keys=True)
+    try:
+        if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > LOG_MAX_BYTES:
+            with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
+                tail = f.readlines()[-LOG_KEEP_LINES:]
+            with open(LOG_PATH, "w", encoding="utf-8") as f:
+                f.writelines(tail)
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        os.chmod(LOG_PATH, 0o600)
+    except OSError:
+        pass
+
+
+# --- config ---
+
+
 def default_config():
     return {
         "webhook": "",
         "secret": "",
         "keyword": "[AI通知]",
         "machine_label": "machine",
-        "activity": {"idle_window": 300},
+        "presence": {"away_threshold": 120, "windows_input": True},
+        "notify": {"min_elapsed": 45, "queue_ttl": 1800, "intervention_cooldown": 600},
         "content": {
             "max_changed_files": 10,
             "path_mode": "project",
@@ -134,28 +192,22 @@ def load_config(required=True):
         print("配置缺少 webhook", file=sys.stderr)
         sys.exit(1)
 
-    cfg.setdefault("keyword", "[AI通知]")
-    cfg.setdefault("machine_label", "machine")
-    cfg.setdefault("activity", {})
-    cfg["activity"]["idle_window"] = int(cfg["activity"].get("idle_window", 300))
-    cfg.setdefault("content", {})
-    cfg["content"]["max_changed_files"] = int(cfg["content"].get("max_changed_files", 10))
-    cfg["content"].setdefault("path_mode", "project")
-    cfg["content"].setdefault("include_privacy_note", True)
+    defaults = default_config()
+    for key in ("keyword", "machine_label"):
+        cfg.setdefault(key, defaults[key])
+    for section in ("presence", "notify", "content"):
+        cfg.setdefault(section, {})
+        for key, value in defaults[section].items():
+            cfg[section].setdefault(key, value)
+    cfg["presence"]["away_threshold"] = int(cfg["presence"]["away_threshold"])
+    cfg["notify"]["min_elapsed"] = int(cfg["notify"]["min_elapsed"])
+    cfg["notify"]["queue_ttl"] = int(cfg["notify"]["queue_ttl"])
+    cfg["notify"]["intervention_cooldown"] = int(cfg["notify"]["intervention_cooldown"])
+    cfg["content"]["max_changed_files"] = int(cfg["content"]["max_changed_files"])
     return cfg
 
 
-def fmt_duration(seconds):
-    if seconds is None:
-        return "未知"
-    total = max(0, int(seconds))
-    h, remainder = divmod(total, 3600)
-    m, s = divmod(remainder, 60)
-    if h:
-        return f"{h}小时{m}分{s}秒"
-    if m:
-        return f"{m}分{s}秒"
-    return f"{s}秒"
+# --- Feishu ---
 
 
 def send_feishu(config, title, content):
@@ -195,6 +247,118 @@ def send_feishu(config, title, content):
     return True
 
 
+def try_send(config, title, content):
+    last_error = None
+    for attempt in range(2):
+        try:
+            return send_feishu(config, title, content)
+        except Exception as e:
+            last_error = e
+            if attempt == 0:
+                time.sleep(1)
+    print(f"llm-notify: 发送失败: {last_error}", file=sys.stderr)
+    return False
+
+
+# --- presence ---
+
+_IS_WSL = None
+
+
+def is_wsl():
+    global _IS_WSL
+    if _IS_WSL is None:
+        try:
+            with open("/proc/version", "r", encoding="utf-8", errors="replace") as f:
+                _IS_WSL = "microsoft" in f.read().lower()
+        except OSError:
+            _IS_WSL = False
+    return _IS_WSL
+
+
+def input_last_active():
+    data = read_json(PRESENCE_PATH, {}) or {}
+    try:
+        return float(data.get("global_last_human_input_at") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def record_human_input(ts):
+    write_json_atomic(PRESENCE_PATH, {"global_last_human_input_at": ts})
+
+
+def tty_last_active():
+    latest = 0.0
+    try:
+        names = os.listdir("/dev/pts")
+    except OSError:
+        return 0.0
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            atime = os.stat(os.path.join("/dev/pts", name)).st_atime
+        except OSError:
+            continue
+        latest = max(latest, atime)
+    return latest
+
+
+def windows_last_active(config):
+    if not config.get("presence", {}).get("windows_input", True) or not is_wsl():
+        return None
+    now = now_ts()
+    cache = read_json(WIN_IDLE_CACHE, {}) or {}
+    checked = float(cache.get("checked_at") or 0)
+    if now - checked < WIN_IDLE_CACHE_TTL:
+        idle = cache.get("idle_seconds")
+        return checked - float(idle) if idle is not None else None
+
+    exe = shutil.which("powershell.exe")
+    idle = None
+    if exe:
+        try:
+            result = subprocess.run(
+                [exe, "-NoProfile", "-NonInteractive", "-Command", WIN_IDLE_PS],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=3,
+            )
+            if result.returncode == 0:
+                idle = float(result.stdout.strip())
+        except (OSError, subprocess.SubprocessError, ValueError):
+            idle = None
+    write_json_atomic(WIN_IDLE_CACHE, {"checked_at": now, "idle_seconds": idle})
+    return now - idle if idle is not None else None
+
+
+def presence_sources(config):
+    sources = {"input": input_last_active(), "tty": tty_last_active()}
+    win = windows_last_active(config)
+    if win is not None:
+        sources["windows"] = win
+    return sources
+
+
+def presence_idle(config):
+    fake = os.environ.get("LLM_NOTIFY_FAKE_IDLE")
+    if fake is not None:
+        return float(fake)
+    last = max(presence_sources(config).values())
+    if last <= 0:
+        return float("inf")
+    return max(0.0, now_ts() - last)
+
+
+def is_away(config):
+    return presence_idle(config) >= config["presence"]["away_threshold"]
+
+
+# --- tool / event helpers ---
+
+
 def norm_event(value):
     return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
 
@@ -204,7 +368,6 @@ def get_event_name(info):
         info.get("hook_event_name")
         or info.get("event_name")
         or info.get("event")
-        or info.get("type")
         or ""
     )
 
@@ -219,25 +382,19 @@ def detect_tool(info, arg_tool=None):
         return "codex"
     if info.get("thread-id") or info.get("thread_id") or info.get("turn-id"):
         return "codex"
-    if info.get("permission_mode") or info.get("transcript_path"):
-        path = str(info.get("transcript_path") or "")
-        if ".codex" in path:
-            return "codex"
-        return "claude"
+    if info.get("transcript_path") or info.get("permission_mode"):
+        return "codex" if ".codex" in str(info.get("transcript_path") or "") else "claude"
     return "unknown"
 
 
-def extract_ids(info):
-    session_id = (
+def extract_session_id(info):
+    return str(
         info.get("session_id")
         or info.get("session-id")
         or info.get("thread_id")
         or info.get("thread-id")
         or "unknown"
     )
-    thread_id = info.get("thread_id") or info.get("thread-id") or ""
-    turn_id = info.get("turn_id") or info.get("turn-id") or ""
-    return str(session_id), str(thread_id), str(turn_id)
 
 
 def extract_cwd(info):
@@ -245,23 +402,53 @@ def extract_cwd(info):
     return os.path.abspath(os.path.expanduser(str(cwd)))
 
 
-def make_task_id(tool, session_id, turn_id=""):
-    parts = [tool or "unknown", session_id or "unknown"]
-    if turn_id:
-        parts.append(turn_id)
-    return safe_state_name("__".join(parts))
-
-
 def extract_prompt(info):
     value = info.get("prompt") or ""
     return value if isinstance(value, str) else ""
 
 
-def explicit_notify_requested(prompt):
-    return bool(prompt and EXPLICIT_NOTIFY_RE.search(prompt))
+def tool_name_from_info(info):
+    name = info.get("tool_name") or info.get("name") or ""
+    if not name and isinstance(info.get("tool"), dict):
+        name = info["tool"].get("name") or ""
+    return str(name)
 
 
-def run_git(cwd, args, binary=False):
+def tool_input_from_info(info):
+    value = info.get("tool_input") or info.get("input") or info.get("arguments") or {}
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return value if isinstance(value, dict) else {}
+
+
+def tool_label(tool):
+    if tool == "claude":
+        return "Claude Code"
+    if tool == "codex":
+        return "Codex"
+    return "AI"
+
+
+def classify_stop_failure(info):
+    text = str(info.get("error") or info.get("error_type") or info.get("matcher") or "")
+    low = text.lower()
+    if "rate" in low or "limit" in low:
+        return "API 错误: rate_limit"
+    if "auth" in low or "permission" in low:
+        return "API 错误: auth_or_permission"
+    if "network" in low or "timeout" in low:
+        return "API 错误: network"
+    return "API 或 StopFailure"
+
+
+# --- git ---
+
+
+def run_git(cwd, args, binary=False, timeout=3):
     try:
         result = subprocess.run(
             ["git", *args],
@@ -269,7 +456,7 @@ def run_git(cwd, args, binary=False):
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=not binary,
-            timeout=3,
+            timeout=timeout,
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
@@ -277,30 +464,6 @@ def run_git(cwd, args, binary=False):
     if result.returncode != 0:
         return None
     return result.stdout
-
-
-def is_sensitive_path(path):
-    parts = [p for p in re.split(r"[\/]+", str(path or "")) if p]
-    for part in parts:
-        low = part.lower()
-        if low in SENSITIVE_NAMES or low.startswith(".env."):
-            return True
-        if low.endswith(SENSITIVE_EXTS) or SENSITIVE_WORD_RE.search(low):
-            return True
-    return False
-
-
-def display_files(paths, max_files):
-    shown = []
-    hidden = 0
-    for item in paths[:max_files]:
-        if is_sensitive_path(item):
-            hidden += 1
-        else:
-            shown.append(item)
-    if hidden:
-        shown.append(f"<敏感路径已隐藏> ({hidden})")
-    return shown
 
 
 def parse_porcelain_z(data):
@@ -327,27 +490,55 @@ def parse_porcelain_z(data):
 
 
 def git_snapshot(cwd):
-    root = run_git(cwd, ["rev-parse", "--show-toplevel"])
+    root = run_git(cwd, ["rev-parse", "--show-toplevel"], timeout=2)
     if not root:
         return {}
     root = root.strip()
-    head = run_git(root, ["rev-parse", "HEAD"])
-    status = run_git(
+    head = run_git(root, ["rev-parse", "HEAD"], timeout=2)
+    raw = run_git(
         root,
         ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
         binary=True,
+        timeout=2,
     )
+    status = parse_porcelain_z(raw) if raw is not None else None
+    if status is not None and len(status) > GIT_STATUS_CAP:
+        status = None  # huge dirty worktree: summary would be meaningless
     return {
         "git_root": root,
-        "git_head": (head or "").strip(),
-        "git_status": parse_porcelain_z(status),
+        "git_head_at_start": (head or "").strip(),
+        "git_status_at_start": status,
     }
 
 
-def changed_files_summary(turn, config):
-    max_files = config.get("content", {}).get("max_changed_files", 10)
-    git_root = turn.get("git_root")
-    start = turn.get("git_status_at_start") or {}
+def is_sensitive_path(path):
+    parts = [p for p in re.split(r"[\/]+", str(path or "")) if p]
+    for part in parts:
+        low = part.lower()
+        if low in SENSITIVE_NAMES or low.startswith(".env."):
+            return True
+        if low.endswith(SENSITIVE_EXTS) or SENSITIVE_WORD_RE.search(low):
+            return True
+    return False
+
+
+def display_files(paths, max_files):
+    shown = []
+    hidden = 0
+    for item in paths[:max_files]:
+        if is_sensitive_path(item):
+            hidden += 1
+        else:
+            shown.append(item)
+    if hidden:
+        shown.append(f"<敏感路径已隐藏> ({hidden})")
+    return shown
+
+
+def changed_files_summary(snap, config):
+    max_files = config["content"]["max_changed_files"]
+    git_root = snap.get("git_root")
+    start = snap.get("git_status_at_start")
     summary = {
         "files": [],
         "preexisting_dirty_count": 0,
@@ -357,11 +548,12 @@ def changed_files_summary(turn, config):
         "status_failed": False,
     }
 
-    if git_root:
+    if git_root and start is not None:
         end_raw = run_git(
             git_root,
             ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
             binary=True,
+            timeout=3,
         )
         if end_raw is None:
             summary["status_failed"] = True
@@ -369,7 +561,7 @@ def changed_files_summary(turn, config):
         end = parse_porcelain_z(end_raw)
         end_head = (run_git(git_root, ["rev-parse", "HEAD"]) or "").strip()
         summary["head_changed"] = bool(
-            turn.get("git_head_at_start") and end_head != turn.get("git_head_at_start")
+            snap.get("git_head_at_start") and end_head != snap.get("git_head_at_start")
         )
 
         start_keys = set(start)
@@ -388,248 +580,194 @@ def changed_files_summary(turn, config):
         summary["cleaned_count"] = len(cleaned)
         return summary
 
-    candidates = sorted(set(turn.get("file_candidates") or []))
+    if git_root and start is None:
+        summary["status_failed"] = True
+        return summary
+
+    candidates = sorted(set(snap.get("file_candidates") or []))
     summary["files"] = display_files(candidates, max_files)
     summary["more_count"] = max(0, len(candidates) - max_files)
     return summary
 
 
-def activity_state():
-    activity = read_json(
-        ACTIVITY_PATH,
-        {"global_last_human_input_at": 0, "by_session": {}, "current_task_by_session": {}},
-    )
-    activity.setdefault("by_session", {})
-    activity.setdefault("current_task_by_session", {})
-    return activity
+# --- sessions ---
 
 
-def save_activity(activity):
-    activity.setdefault("by_session", {})
-    activity.setdefault("current_task_by_session", {})
-    write_json_atomic(ACTIVITY_PATH, activity)
+def session_path(tool, session_id):
+    return os.path.join(SESSIONS_DIR, safe_state_name(f"{tool}__{session_id}") + ".json")
 
 
-def session_key(tool, session_id):
-    return f"{tool or 'unknown'}:{session_id or 'unknown'}"
-
-
-def turn_path(task_id):
-    return os.path.join(TURNS_DIR, f"{safe_state_name(task_id)}.json")
-
-
-def pending_path(pending_id):
-    return os.path.join(PENDING_DIR, f"{safe_state_name(pending_id)}.json")
-
-
-def pending_lock_path(pending_id):
-    return os.path.join(PENDING_DIR, f"{safe_state_name(pending_id)}.lock")
-
-
-def load_turn(task_id):
-    return read_json(turn_path(task_id), {})
-
-
-def save_turn(turn):
-    write_json_atomic(turn_path(turn["task_id"]), turn)
-
-
-def load_pending(pending_id):
-    return read_json(pending_path(pending_id), {})
-
-
-def save_pending(pending):
-    write_json_atomic(pending_path(pending["pending_id"]), pending)
-
-
-def claim_pending(pending_id):
-    ensure_state_dirs()
-    lock_path = pending_lock_path(pending_id)
-    try:
-        if os.path.exists(lock_path) and now_ts() - os.path.getmtime(lock_path) > 600:
-            os.unlink(lock_path)
-    except OSError:
-        pass
-    try:
-        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError:
-        return False
-    except OSError:
-        return False
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(str(os.getpid()))
-    return True
-
-
-def release_pending(pending_id):
-    try:
-        os.unlink(pending_lock_path(pending_id))
-    except OSError:
-        pass
-
-
-def update_activity_for_prompt(tool, session_id, ts, task_id):
-    activity = activity_state()
-    activity["global_last_human_input_at"] = ts
-    activity.setdefault("by_session", {})[session_id] = ts
-    activity.setdefault("current_task_by_session", {})[session_key(tool, session_id)] = task_id
-    save_activity(activity)
-    return activity
-
-
-def create_or_update_turn(info, tool, session_id, thread_id, turn_id):
-    ts = now_ts()
-    cwd = extract_cwd(info)
-    local_turn_id = turn_id or f"local-{int(ts * 1000)}-{os.getpid()}"
-    task_id = make_task_id(tool, session_id, local_turn_id)
-    turn = {
-        "task_id": task_id,
+def load_session(tool, session_id):
+    default = {
         "tool": tool,
         "session_id": session_id,
-        "thread_id": thread_id,
-        "turn_id": turn_id,
-        "local_turn_id": local_turn_id,
-        "started_at": ts,
-        "cwd": cwd,
-        "tool_count": 0,
-        "failure_count": 0,
-        "explicit_notify": explicit_notify_requested(extract_prompt(info)),
-        "file_candidates": [],
+        "last_input_at": 0,
+        "last_activity_at": 0,
+        "last_intervention_sent_at": 0,
+        "turn": None,
     }
-    snapshot = git_snapshot(cwd)
-    if snapshot:
-        turn["git_root"] = snapshot["git_root"]
-        turn["git_head_at_start"] = snapshot["git_head"]
-        turn["git_status_at_start"] = snapshot["git_status"]
-    save_turn(turn)
-    return turn
-
-
-def find_turn(info, tool, session_id, turn_id):
-    if turn_id:
-        task_id = make_task_id(tool, session_id, turn_id)
-        turn = load_turn(task_id)
-        if turn:
-            return turn
-
-    activity = activity_state()
-    current_id = (activity.get("current_task_by_session") or {}).get(session_key(tool, session_id))
-    if current_id:
-        turn = load_turn(current_id)
-        if turn:
-            return turn
-
-    fallback = make_task_id(tool, session_id, "")
-    turn = load_turn(fallback)
-    if turn:
-        return turn
-
-    local_turn_id = turn_id or f"local-{int(now_ts() * 1000)}-{os.getpid()}"
-    return {
-        "task_id": make_task_id(tool, session_id, local_turn_id),
-        "tool": tool,
-        "session_id": session_id,
-        "turn_id": turn_id,
-        "local_turn_id": local_turn_id,
-        "started_at": now_ts(),
-        "cwd": extract_cwd(info),
-        "tool_count": 0,
-        "failure_count": 0,
-        "explicit_notify": False,
-        "file_candidates": [],
-    }
-
-
-def nested_get(data, names):
+    data = read_json(session_path(tool, session_id))
     if not isinstance(data, dict):
-        return None
+        return default
+    for key, value in default.items():
+        data.setdefault(key, value)
+    return data
+
+
+def save_session(session):
+    write_json_atomic(session_path(session["tool"], session["session_id"]), session)
+
+
+def gc_sessions():
+    if not os.path.isdir(SESSIONS_DIR):
+        return
+    cutoff = now_ts() - SESSION_GC_AGE
+    try:
+        names = os.listdir(SESSIONS_DIR)
+    except OSError:
+        return
     for name in names:
-        if name in data:
-            return data[name]
-    return None
-
-
-def tool_name_from_info(info):
-    return (
-        info.get("tool_name")
-        or info.get("name")
-        or nested_get(info.get("tool") or {}, ["name"])
-        or ""
-    )
-
-
-def tool_input_from_info(info):
-    value = info.get("tool_input") or info.get("input") or info.get("arguments") or {}
-    if isinstance(value, str):
+        path = os.path.join(SESSIONS_DIR, name)
         try:
-            parsed = json.loads(value)
-            return parsed if isinstance(parsed, dict) else {}
-        except json.JSONDecodeError:
-            return {}
-    return value if isinstance(value, dict) else {}
+            if os.path.getmtime(path) < cutoff:
+                os.unlink(path)
+        except OSError:
+            continue
 
 
-def tool_failed(info):
-    for key in ("exit_code", "exitCode", "status_code", "returncode"):
-        value = info.get(key)
-        if isinstance(value, int) and value != 0:
-            return True
-    response = info.get("tool_response") or info.get("output") or {}
-    if isinstance(response, dict):
-        for key in ("exit_code", "exitCode", "status_code", "returncode"):
-            value = response.get(key)
-            if isinstance(value, int) and value != 0:
-                return True
-        if response.get("success") is False:
-            return True
-    return False
+# --- queue ---
 
 
-def handle_tool_event(info, tool, session_id, turn_id, failed=False):
-    turn = find_turn(info, tool, session_id, turn_id)
-    turn["tool_count"] = int(turn.get("tool_count", 0)) + 1
-    if failed or tool_failed(info):
-        turn["failure_count"] = int(turn.get("failure_count", 0)) + 1
-
-    name = str(tool_name_from_info(info))
-    tool_input = tool_input_from_info(info)
-    candidates = set(turn.get("file_candidates") or [])
-    if name in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
-        path = tool_input.get("file_path") or tool_input.get("path")
-        if path:
-            path = str(path)
-            candidates.add(os.path.basename(path) if os.path.isabs(path) else path)
-    if name == "apply_patch":
-        turn["edited_with_patch"] = True
-
-    turn["file_candidates"] = sorted(candidates)
-    save_turn(turn)
+def queue_entries():
+    if not os.path.isdir(QUEUE_DIR):
+        return []
+    entries = []
+    try:
+        names = sorted(os.listdir(QUEUE_DIR))
+    except OSError:
+        return []
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        data = read_json(os.path.join(QUEUE_DIR, name))
+        if isinstance(data, dict) and data.get("id"):
+            entries.append(data)
+    return entries
 
 
-def tool_label(tool):
-    if tool == "claude":
-        return "Claude Code"
-    if tool == "codex":
-        return "Codex"
-    return "AI"
+def queue_entry_path(entry_id):
+    return os.path.join(QUEUE_DIR, safe_state_name(entry_id) + ".json")
 
 
-def project_label(turn):
-    root = turn.get("git_root") or turn.get("cwd") or ""
+def remove_entry(entry_id):
+    try:
+        os.unlink(queue_entry_path(entry_id))
+    except OSError:
+        pass
+
+
+def save_entry(entry):
+    write_json_atomic(queue_entry_path(entry["id"]), entry)
+
+
+def enqueue(config, kind, tool, session_id, reason="", snapshot=None):
+    created = now_ts()
+    if kind == "intervention":
+        for entry in queue_entries():
+            if (
+                entry.get("kind") == "intervention"
+                and entry.get("tool") == tool
+                and entry.get("session_id") == session_id
+            ):
+                return entry  # one pending intervention per session is enough
+    entry = {
+        "id": safe_state_name(f"{kind}__{tool}__{session_id}__{int(created * 1000)}"),
+        "kind": kind,
+        "tool": tool,
+        "session_id": session_id,
+        "created_at": created,
+        "expires_at": created + config["notify"]["queue_ttl"],
+        "attempts": 0,
+        "reason": reason,
+        "snapshot": snapshot or {},
+    }
+    save_entry(entry)
+    spawn_watcher()
+    return entry
+
+
+def cancel_session_entries(tool, session_id, kinds, why):
+    removed = 0
+    for entry in queue_entries():
+        if entry.get("tool") != tool or entry.get("session_id") != session_id:
+            continue
+        if entry.get("kind") not in kinds:
+            continue
+        remove_entry(entry["id"])
+        removed += 1
+        log_decision(
+            "cancelled",
+            kind=entry.get("kind"),
+            tool=tool,
+            session=session_id,
+            reason=why,
+        )
+    return removed
+
+
+def spawn_watcher():
+    if os.environ.get("LLM_NOTIFY_NO_SPAWN") == "1":
+        return
+    try:
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "watch"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        pass
+
+
+# --- rendering ---
+
+
+def fmt_duration(seconds):
+    if seconds is None:
+        return "未知"
+    total = max(0, int(seconds))
+    h, remainder = divmod(total, 3600)
+    m, s = divmod(remainder, 60)
+    if h:
+        return f"{h}小时{m}分{s}秒"
+    if m:
+        return f"{m}分{s}秒"
+    return f"{s}秒"
+
+
+def project_label(snap):
+    root = snap.get("git_root") or snap.get("cwd") or ""
     name = os.path.basename(os.path.normpath(root)) if root else "unknown"
     return name or "unknown"
 
 
-def render_completion_message(config, turn, trigger):
-    elapsed = None
-    if turn.get("started_at") and turn.get("completed_at"):
-        elapsed = float(turn["completed_at"]) - float(turn["started_at"])
+def privacy_note(config):
+    if config["content"].get("include_privacy_note", True):
+        return "隐私: 未发送 prompt、回复正文、命令输出、diff 内容"
+    return ""
 
-    summary = changed_files_summary(turn, config)
+
+def render_completion(config, snap, trigger):
+    elapsed = None
+    if snap.get("started_at") and snap.get("completed_at"):
+        elapsed = float(snap["completed_at"]) - float(snap["started_at"])
+
+    summary = changed_files_summary(snap, config)
     lines = [
-        f"工具: {tool_label(turn.get('tool'))}",
+        f"工具: {tool_label(snap.get('tool'))}",
         f"机器: {config.get('machine_label', 'machine')}",
-        f"项目: {project_label(turn)}",
+        f"项目: {project_label(snap)}",
         f"耗时: {fmt_duration(elapsed)}",
         f"触发: {trigger}",
     ]
@@ -650,276 +788,351 @@ def render_completion_message(config, turn, trigger):
         notes.append(f"任务期间清理了既有脏文件 {summary['cleaned_count']} 个")
     if summary["head_changed"]:
         notes.append("HEAD 已变化，工作区摘要不代表全部改动")
-    if summary.get("status_failed"):
-        notes.append("Git 状态读取失败，改动文件不可判定")
+    if summary["status_failed"]:
+        notes.append("Git 状态不可判定")
     if notes:
         lines.append("备注: " + "；".join(notes))
 
     lines.append(
-        f"执行: 工具 {int(turn.get('tool_count', 0))} 次，失败 {int(turn.get('failure_count', 0))} 次"
+        f"执行: 工具 {int(snap.get('tool_count', 0))} 次，失败 {int(snap.get('failure_count', 0))} 次"
     )
-    if config.get("content", {}).get("include_privacy_note", True):
-        lines.append("隐私: 未发送 prompt、回复正文、命令输出、diff 内容")
+    note = privacy_note(config)
+    if note:
+        lines.append(note)
     return "\n".join(lines)
 
 
-def render_intervention_message(config, tool, reason, turn=None):
+def render_intervention(config, tool, reason, snap=None):
     lines = [f"工具: {tool_label(tool)}", f"机器: {config.get('machine_label', 'machine')}"]
-    if turn:
-        lines.append(f"项目: {project_label(turn)}")
+    if snap:
+        lines.append(f"项目: {project_label(snap)}")
     lines.append(f"事件: {reason}")
-    if config.get("content", {}).get("include_privacy_note", True):
-        lines.append("隐私: 未发送 prompt、命令内容、错误详情")
+    note = privacy_note(config)
+    if note:
+        lines.append(note)
     return "\n".join(lines)
 
 
-def send_completion(turn, trigger):
-    config = load_config(required=True)
-    title = f"{tool_label(turn.get('tool'))} 任务完成"
-    return send_feishu(config, title, render_completion_message(config, turn, trigger))
+def render_batch(config, entries):
+    lines = [f"机器: {config.get('machine_label', 'machine')}"]
+    for i, entry in enumerate(entries, 1):
+        snap = entry.get("snapshot") or {}
+        label = tool_label(entry.get("tool"))
+        proj = project_label(snap)
+        if entry.get("kind") == "completion":
+            elapsed = None
+            if snap.get("started_at") and snap.get("completed_at"):
+                elapsed = float(snap["completed_at"]) - float(snap["started_at"])
+            summary = changed_files_summary(snap, config)
+            nfiles = len([f for f in summary["files"] if not f.startswith("<敏感")])
+            nfiles += summary["more_count"]
+            item = f"{i}. {label} 任务完成 · {proj} · {fmt_duration(elapsed)} · 改动 {nfiles} 个文件"
+            failures = int(snap.get("failure_count", 0))
+            if failures:
+                item += f" · 失败 {failures} 次"
+        else:
+            item = f"{i}. {label} 需要处理 · {proj} · {entry.get('reason') or '需要用户处理'}"
+        lines.append(item)
+    note = privacy_note(config)
+    if note:
+        lines.append(note)
+    return "\n".join(lines)
 
 
-def send_completion_once(turn, trigger):
-    current = load_turn(turn.get("task_id")) or turn
-    if current.get("completion_sent_at"):
-        return True
-    try:
-        ok = send_completion(current, trigger)
-    except Exception:
-        return False
+# --- sending ---
+
+
+def send_completion_now(config, snap, trigger):
+    title = f"{tool_label(snap.get('tool'))} 任务完成"
+    return try_send(config, title, render_completion(config, snap, trigger))
+
+
+def send_intervention_now(config, tool, reason, snap=None):
+    title = f"{tool_label(tool)} 需要处理"
+    return try_send(config, title, render_intervention(config, tool, reason, snap))
+
+
+def mark_intervention_sent(tool, session_id):
+    session = load_session(tool, session_id)
+    session["last_intervention_sent_at"] = now_ts()
+    save_session(session)
+
+
+def send_batch(config, entries):
+    if len(entries) == 1:
+        entry = entries[0]
+        if entry["kind"] == "completion":
+            ok = send_completion_now(config, entry["snapshot"], "离开后送达")
+        else:
+            ok = send_intervention_now(
+                config, entry.get("tool"), entry.get("reason") or "需要用户处理", entry.get("snapshot")
+            )
+    else:
+        title = f"离开期间 {len(entries)} 项更新"
+        ok = try_send(config, title, render_batch(config, entries))
     if ok:
-        current["completion_sent_at"] = now_ts()
-        current["completion_trigger"] = trigger
-        save_turn(current)
+        for entry in entries:
+            if entry["kind"] == "intervention":
+                mark_intervention_sent(entry["tool"], entry["session_id"])
     return ok
 
 
-def send_intervention(tool, reason, turn=None):
-    config = load_config(required=True)
-    title = f"{tool_label(tool)} 需要处理"
-    return send_feishu(config, title, render_intervention_message(config, tool, reason, turn))
+# --- event handlers ---
 
 
-def classify_stop_failure(info):
-    text = str(info.get("error") or info.get("error_type") or "")
-    low = text.lower()
-    if "rate" in low or "limit" in low:
-        return "API 错误: rate_limit"
-    if "auth" in low or "permission" in low:
-        return "API 错误: auth_or_permission"
-    if "network" in low or "timeout" in low:
-        return "API 错误: network"
-    return "API 或 StopFailure"
-
-
-def pending_id_for(turn, completed_at):
-    return safe_state_name(f"{turn['task_id']}__{int(completed_at)}")
-
-
-def write_pending(turn, completed_at, last_input_seen, due_at):
-    pending_id = pending_id_for(turn, completed_at)
-    pending = {
-        "pending_id": pending_id,
-        "task_id": turn["task_id"],
-        "tool": turn.get("tool", "unknown"),
-        "session_id": turn.get("session_id", "unknown"),
-        "completed_at": completed_at,
-        "last_input_at_seen": last_input_seen,
-        "due_at": due_at,
-        "status": "pending",
-        "attempts": 0,
+def handle_prompt(info, tool, session_id):
+    ts = now_ts()
+    record_human_input(ts)
+    session = load_session(tool, session_id)
+    session["last_input_at"] = ts
+    session["last_activity_at"] = ts
+    cwd = extract_cwd(info)
+    turn = {
+        "tool": tool,
+        "session_id": session_id,
+        "started_at": ts,
+        "cwd": cwd,
+        "tool_count": 0,
+        "failure_count": 0,
+        "explicit_notify": bool(EXPLICIT_NOTIFY_RE.search(extract_prompt(info))),
+        "file_candidates": [],
     }
-    save_pending(pending)
-    spawn_pending_check(pending_id)
-    return pending
+    turn.update(git_snapshot(cwd))
+    session["turn"] = turn
+    save_session(session)
+    cancel_session_entries(tool, session_id, ("completion", "intervention"), "session_continued")
 
 
-def spawn_pending_check(pending_id):
-    if os.environ.get("LLM_NOTIFY_NO_SPAWN") == "1":
-        return
-    try:
-        subprocess.Popen(
-            [sys.executable, os.path.abspath(__file__), "pending-check", pending_id],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-    except OSError:
-        pass
+def handle_tool_event(info, tool, session_id, failed):
+    session = load_session(tool, session_id)
+    session["last_activity_at"] = now_ts()
+    turn = session.get("turn")
+    if isinstance(turn, dict):
+        turn["tool_count"] = int(turn.get("tool_count", 0)) + 1
+        if failed:
+            turn["failure_count"] = int(turn.get("failure_count", 0)) + 1
+        name = tool_name_from_info(info)
+        if name in EDIT_TOOLS:
+            tool_input = tool_input_from_info(info)
+            path = tool_input.get("file_path") or tool_input.get("path")
+            if path:
+                path = str(path)
+                candidates = set(turn.get("file_candidates") or [])
+                candidates.add(os.path.basename(path) if os.path.isabs(path) else path)
+                turn["file_candidates"] = sorted(candidates)
+    save_session(session)
+    # the session is running again, so any pending "stuck on a prompt" alert is stale
+    cancel_session_entries(tool, session_id, ("intervention",), "session_active")
 
 
-def process_pending_id(pending_id, wait=False):
-    config = load_config(required=False)
-    while True:
-        pending = load_pending(pending_id)
-        if not pending or pending.get("status") != "pending":
-            return
-        delay = float(pending.get("due_at", 0)) - now_ts()
-        if delay > 0:
-            if not wait:
-                return
-            time.sleep(min(delay, 300))
-            continue
+def handle_stop(info, tool, session_id, config):
+    completed = now_ts()
+    session = load_session(tool, session_id)
+    turn = session.get("turn")
+    session["turn"] = None
+    session["last_activity_at"] = completed
+    save_session(session)
 
-        activity = activity_state()
-        global_last = float(activity.get("global_last_human_input_at") or 0)
-        session_last = float((activity.get("by_session") or {}).get(pending.get("session_id"), 0))
-        completed_at = float(pending.get("completed_at") or 0)
-
-        if session_last > completed_at:
-            pending["status"] = "cancelled"
-            pending["cancelled_at"] = now_ts()
-            pending["cancel_reason"] = "same_session_continued"
-            save_pending(pending)
-            return
-
-        if global_last > float(pending.get("last_input_at_seen") or 0):
-            pending["last_input_at_seen"] = global_last
-            pending["due_at"] = global_last + int(config["activity"]["idle_window"])
-            pending["attempts"] = int(pending.get("attempts", 0)) + 1
-            save_pending(pending)
-            if wait:
-                continue
-            return
-
-        turn = load_turn(pending.get("task_id"))
-        if not turn:
-            pending["status"] = "cancelled"
-            pending["cancelled_at"] = now_ts()
-            pending["cancel_reason"] = "missing_turn"
-            save_pending(pending)
-            return
-
-        if turn.get("completion_sent_at"):
-            pending["status"] = "sent"
-            pending["sent_at"] = turn.get("completion_sent_at")
-            save_pending(pending)
-            return
-
-        if not claim_pending(pending_id):
-            return
-        ok = False
-        try:
-            pending = load_pending(pending_id)
-            if not pending or pending.get("status") != "pending":
-                return
-            turn = load_turn(pending.get("task_id"))
-            if not turn:
-                pending["status"] = "cancelled"
-                pending["cancelled_at"] = now_ts()
-                pending["cancel_reason"] = "missing_turn"
-                save_pending(pending)
-                return
-            ok = send_completion_once(turn, "离开后补发")
-            pending = load_pending(pending_id)
-            if not pending or pending.get("status") != "pending":
-                return
-            if ok:
-                pending["status"] = "sent"
-                pending["sent_at"] = now_ts()
-            else:
-                pending["attempts"] = int(pending.get("attempts", 0)) + 1
-                pending["due_at"] = now_ts() + 60
-            save_pending(pending)
-        finally:
-            release_pending(pending_id)
-        if ok or wait:
-            if ok:
-                return
-            continue
-        spawn_pending_check(pending_id)
+    if not isinstance(turn, dict):
+        log_decision("suppressed", event="stop", tool=tool, session=session_id, reason="no_turn")
         return
 
-
-def process_due_pending():
-    if not os.path.isdir(PENDING_DIR):
-        return
-    try:
-        names = list(os.listdir(PENDING_DIR))
-    except OSError:
-        return
-    for name in names:
-        if not name.endswith(".json"):
-            continue
-        pending_id = name[:-5]
-        pending = load_pending(pending_id)
-        if pending.get("status") == "pending" and float(pending.get("due_at", 0)) <= now_ts():
-            try:
-                process_pending_id(pending_id, wait=False)
-            except BaseException:
-                continue
-
-
-def handle_stop(info, tool, session_id, turn_id):
-    turn = find_turn(info, tool, session_id, turn_id)
-    completed_at = now_ts()
-    turn["completed_at"] = completed_at
-    save_turn(turn)
+    snap = dict(turn)
+    snap["completed_at"] = completed
+    elapsed = completed - float(turn.get("started_at") or completed)
 
     if turn.get("explicit_notify"):
-        send_completion_once(turn, "显式要求通知")
-        return
-    if int(turn.get("failure_count", 0)) > 0:
-        send_completion_once(turn, "任务存在失败")
-        return
-
-    config = load_config(required=False)
-    activity = activity_state()
-    global_last = float(activity.get("global_last_human_input_at") or 0)
-    idle_window = int(config["activity"]["idle_window"])
-    if completed_at - global_last >= idle_window:
-        send_completion_once(turn, "离开后完成")
+        if not send_completion_now(config, snap, "显式要求通知"):
+            enqueue(config, "completion", tool, session_id, snapshot=snap)
+        log_decision("sent_now", event="stop", tool=tool, session=session_id, reason="explicit")
         return
 
-    write_pending(turn, completed_at, global_last, global_last + idle_window)
+    if elapsed < config["notify"]["min_elapsed"]:
+        log_decision(
+            "suppressed",
+            event="stop",
+            tool=tool,
+            session=session_id,
+            reason="short_turn",
+            elapsed=round(elapsed, 1),
+        )
+        return
+
+    if is_away(config):
+        if send_completion_now(config, snap, "离开时完成"):
+            log_decision("sent_now", event="stop", tool=tool, session=session_id, reason="away")
+        else:
+            enqueue(config, "completion", tool, session_id, snapshot=snap)
+            log_decision("queued", event="stop", tool=tool, session=session_id, reason="send_failed")
+        return
+
+    enqueue(config, "completion", tool, session_id, snapshot=snap)
+    log_decision(
+        "queued",
+        event="stop",
+        tool=tool,
+        session=session_id,
+        reason="present",
+        elapsed=round(elapsed, 1),
+    )
+
+
+def handle_intervention(info, tool, session_id, config, reason):
+    session = load_session(tool, session_id)
+    cooldown = config["notify"]["intervention_cooldown"]
+    if now_ts() - float(session.get("last_intervention_sent_at") or 0) < cooldown:
+        log_decision(
+            "suppressed", event="intervention", tool=tool, session=session_id, reason="cooldown"
+        )
+        return
+
+    snap = session.get("turn") if isinstance(session.get("turn"), dict) else {"cwd": extract_cwd(info)}
+    if is_away(config):
+        if send_intervention_now(config, tool, reason, snap):
+            mark_intervention_sent(tool, session_id)
+            log_decision(
+                "sent_now", event="intervention", tool=tool, session=session_id, reason=reason
+            )
+            return
+    enqueue(config, "intervention", tool, session_id, reason=reason, snapshot=snap)
+    log_decision("queued", event="intervention", tool=tool, session=session_id, reason=reason)
 
 
 def handle_event(info, arg_tool=None):
     tool = detect_tool(info, arg_tool)
     event = norm_event(get_event_name(info))
-    session_id, thread_id, turn_id = extract_ids(info)
+    session_id = extract_session_id(info)
 
     if event == "userpromptsubmit":
-        ts = now_ts()
-        turn = create_or_update_turn(info, tool, session_id, thread_id, turn_id)
-        update_activity_for_prompt(tool, session_id, ts, turn["task_id"])
-        process_due_pending()
+        handle_prompt(info, tool, session_id)
         return
 
-    process_due_pending()
-
     if event == "posttooluse":
-        handle_tool_event(info, tool, session_id, turn_id, failed=False)
+        handle_tool_event(info, tool, session_id, failed=False)
         return
 
     if event == "posttoolusefailure":
-        handle_tool_event(info, tool, session_id, turn_id, failed=True)
+        handle_tool_event(info, tool, session_id, failed=True)
         return
 
-    if event == "permissionrequest":
-        return
+    config = load_config(required=False)
 
     if event == "notification":
         ntype = str(info.get("notification_type") or "")
-        if ntype in ("idle_prompt", "elicitation_dialog", ""):
-            turn = find_turn(info, tool, session_id, turn_id)
-            send_intervention(tool, "需要用户处理", turn)
+        reason = INTERVENTION_TYPES.get(ntype)
+        if reason is None:
+            log_decision(
+                "ignored", event="notification", tool=tool, session=session_id, ntype=ntype
+            )
+            return
+        handle_intervention(info, tool, session_id, config, reason)
         return
 
     if event == "stopfailure":
-        turn = find_turn(info, tool, session_id, turn_id)
-        send_intervention(tool, classify_stop_failure(info), turn)
+        handle_intervention(info, tool, session_id, config, classify_stop_failure(info))
         return
 
     if event == "stop":
-        handle_stop(info, tool, session_id, turn_id)
+        handle_stop(info, tool, session_id, config)
         return
+
+
+# --- watcher ---
+
+
+def acquire_watcher_lock():
+    if fcntl is None:
+        return None
+    ensure_state_dirs()
+    try:
+        fd = os.open(WATCHER_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        try:
+            os.close(fd)
+        except (OSError, UnboundLocalError):
+            pass
+        return None
+    os.ftruncate(fd, 0)
+    os.write(fd, str(os.getpid()).encode("ascii"))
+    return fd
+
+
+def watcher_running():
+    if fcntl is None or not os.path.exists(WATCHER_LOCK):
+        return False
+    try:
+        fd = os.open(WATCHER_LOCK, os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+
+
+def sweep_queue(config):
+    """Drop entries that are stale, seen, or expired; return the survivors."""
+    live = []
+    for entry in queue_entries():
+        session = load_session(entry.get("tool"), entry.get("session_id"))
+        created = float(entry.get("created_at") or 0)
+        if entry.get("kind") == "completion" and float(session.get("last_input_at") or 0) > created:
+            remove_entry(entry["id"])
+            log_decision("cancelled", kind="completion", session=entry.get("session_id"), reason="session_continued")
+            continue
+        if entry.get("kind") == "intervention" and float(session.get("last_activity_at") or 0) > created:
+            remove_entry(entry["id"])
+            log_decision("cancelled", kind="intervention", session=entry.get("session_id"), reason="session_active")
+            continue
+        if now_ts() >= float(entry.get("expires_at") or 0):
+            remove_entry(entry["id"])
+            log_decision("expired", kind=entry.get("kind"), session=entry.get("session_id"))
+            continue
+        live.append(entry)
+    return live
+
+
+def cmd_watch():
+    lock_fd = acquire_watcher_lock()
+    if lock_fd is None:
+        return
+    config = load_config(required=False)
+    if not config.get("webhook"):
+        return
+    gc_sessions()
+    while True:
+        entries = sweep_queue(config)
+        if not entries:
+            return
+        if not is_away(config):
+            time.sleep(WATCH_POLL)
+            continue
+        if send_batch(config, entries):
+            for entry in entries:
+                remove_entry(entry["id"])
+            log_decision("sent_batch", count=len(entries))
+            continue  # rescan: new entries may have arrived while we held the lock
+        for entry in entries:
+            entry["attempts"] = int(entry.get("attempts", 0)) + 1
+            if entry["attempts"] > 3:
+                remove_entry(entry["id"])
+                log_decision("failed", kind=entry.get("kind"), session=entry.get("session_id"))
+            else:
+                save_entry(entry)
+        time.sleep(max(WATCH_POLL, 60))
+
+
+# --- CLI ---
 
 
 def cmd_init():
     print("=" * 50)
-    print("llm-notify v2 初始化 - 飞书 Webhook 配置")
+    print("llm-notify v3 初始化 - 飞书 Webhook 配置")
     print("=" * 50)
     print()
     print("飞书 Webhook 创建步骤:")
@@ -936,23 +1149,24 @@ def cmd_init():
     secret = input("签名密钥 Secret (无则回车跳过): ").strip()
     keyword = input("关键词, 如 [AI通知] [默认: [AI通知]]: ").strip() or "[AI通知]"
     machine_label = input("机器标签 [machine]: ").strip() or "machine"
-    idle_raw = input("离开确认窗口 idle_window 秒数 [300]: ").strip()
-    idle_window = int(idle_raw) if idle_raw.isdigit() else 300
+    away_raw = input("离开阈值 away_threshold 秒数 [120]: ").strip()
+    away_threshold = int(away_raw) if away_raw.isdigit() else 120
 
     config = default_config()
-    config.update(
-        {
-            "webhook": webhook,
-            "keyword": keyword,
-            "machine_label": machine_label,
-            "activity": {"idle_window": idle_window},
-        }
-    )
+    config.update({"webhook": webhook, "keyword": keyword, "machine_label": machine_label})
+    config["presence"]["away_threshold"] = away_threshold
+    config["presence"]["windows_input"] = is_wsl()
     if secret:
         config["secret"] = secret
     write_json_atomic(CONFIG_PATH, config)
     print(f"\n配置已写入: {CONFIG_PATH}")
-    print("下一步: llm-notify test")
+
+    print("\npresence 自检:")
+    for name, ts in presence_sources(config).items():
+        ago = f"{now_ts() - ts:.0f}s 前" if ts > 0 else "无信号"
+        print(f"  {name:8s} 最近活动: {ago}")
+    print(f"  WSL 环境: {'是' if is_wsl() else '否'} (windows_input={config['presence']['windows_input']})")
+    print("\n下一步: llm-notify test")
 
 
 def cmd_test():
@@ -1010,11 +1224,63 @@ def cmd_install():
     }
     print(json.dumps(codex_hook_config, ensure_ascii=False, indent=2))
     print()
-    print("Codex hooks 默认启用。如你显式关闭过 hooks，可在 ~/.codex/config.toml 设置:")
-    print("[features]")
-    print("hooks = true")
-    print()
-    print("Codex 中请运行 /hooks review/trust 这些命令 hook。")
+    print("v3 行为: 在场不打扰（完成通知排队），离开立即推送，回到会话自动取消。")
+    print("调试: llm-notify status 查看 presence 判定、队列与决策日志。")
+
+
+def cmd_status():
+    config = load_config(required=False)
+    fake = os.environ.get("LLM_NOTIFY_FAKE_IDLE")
+
+    print("== presence ==")
+    sources = presence_sources(config)
+    for name in ("input", "tty", "windows"):
+        if name in sources:
+            ts = sources[name]
+            ago = f"{now_ts() - ts:7.0f}s 前" if ts > 0 else "   无信号"
+            print(f"  {name:8s} 最近活动: {ago}")
+        elif name == "windows":
+            why = "非 WSL" if not is_wsl() else ("已禁用" if not config["presence"].get("windows_input") else "探测失败")
+            print(f"  {name:8s} 不可用 ({why})")
+    idle = presence_idle(config)
+    threshold = config["presence"]["away_threshold"]
+    state = "离开" if idle >= threshold else "在场"
+    suffix = " [FAKE_IDLE]" if fake is not None else ""
+    idle_text = "inf" if idle == float("inf") else f"{idle:.0f}s"
+    print(f"  判定: {state} (idle={idle_text}, away_threshold={threshold}s){suffix}")
+
+    print("\n== queue ==")
+    entries = queue_entries()
+    if not entries:
+        print("  (空)")
+    for entry in entries:
+        age = now_ts() - float(entry.get("created_at") or 0)
+        left = float(entry.get("expires_at") or 0) - now_ts()
+        snap = entry.get("snapshot") or {}
+        print(
+            f"  {entry.get('kind'):12s} {project_label(snap):20s} "
+            f"等待 {age:5.0f}s, TTL 剩 {max(0, left):5.0f}s, {entry.get('reason') or 'completion'}"
+        )
+
+    print(f"\n== watcher ==\n  {'运行中' if watcher_running() else '未运行'}")
+
+    print("\n== 最近决策 ==")
+    lines = []
+    try:
+        with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()[-10:]
+    except OSError:
+        pass
+    if not lines:
+        print("  (无记录)")
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        ts = time.strftime("%m-%d %H:%M:%S", time.localtime(rec.get("ts", 0)))
+        detail = {k: v for k, v in rec.items() if k not in ("ts", "decision")}
+        print(f"  {ts} {rec.get('decision', '?'):10s} {json.dumps(detail, ensure_ascii=False)}")
 
 
 def cmd_event():
@@ -1022,20 +1288,16 @@ def cmd_event():
     handle_event(read_stdin_json(), arg_tool)
 
 
-def cmd_pending_check():
-    if len(sys.argv) < 3:
-        print("用法: llm-notify pending-check <pending_id>", file=sys.stderr)
-        sys.exit(1)
-    process_pending_id(sys.argv[2], wait=True)
-
-
 COMMANDS = {
     "init": cmd_init,
     "test": cmd_test,
     "install": cmd_install,
+    "status": cmd_status,
     "event": cmd_event,
-    "pending-check": cmd_pending_check,
+    "watch": cmd_watch,
 }
+
+SILENT_COMMANDS = {"event", "watch"}
 
 
 def main():
@@ -1045,7 +1307,7 @@ def main():
         sys.exit(1)
 
     subcmd = sys.argv[1]
-    if subcmd in HOOK_COMMANDS:
+    if subcmd in SILENT_COMMANDS:
         try:
             COMMANDS[subcmd]()
         except BaseException as e:

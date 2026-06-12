@@ -1,52 +1,49 @@
 # llm-notify Roadmap
 
-## v2 Current Direction
+## v3 Current Direction
 
-`llm-notify` is now an away-after-completion receipt tool for Claude Code and Codex CLI.
+`llm-notify` is a presence-gated receipt tool for Claude Code and Codex CLI.
 
 The core rule is:
 
 ```text
-Normal completion is gated by recent human input.
-Events that require intervention notify immediately.
+Never disturb a present user.
+Tell an absent user immediately.
+Never resend what the user has already seen.
 ```
 
-v2 intentionally stays small:
+v3 intentionally stays small:
 
 - Single Python file.
 - Python standard library only.
 - Feishu custom webhook only.
 - Hook input is the main data source.
 - No summary API.
-- No daemon.
+- No long-running daemon: a singleton watcher drains the queue and exits.
 - No transcript or JSONL parsing as the primary path.
 - No prompt, assistant response, command output, or diff content in Feishu messages.
 
-## Implemented v2 Model
+## Implemented v3 Model
 
-### Activity Gate
+### Presence Gate
 
-`UserPromptSubmit` records the latest human input timestamp. Normal completion is sent only when the user has been idle for `activity.idle_window`, default 300 seconds.
+Presence is the freshest of three signals: the latest `UserPromptSubmit` timestamp, `/dev/pts` access times, and Windows `GetLastInputInfo` under WSL. Silence across all signals for `presence.away_threshold` seconds (default 120) counts as away. Unavailable signals degrade to the remaining ones.
 
-If a task completes while the user is still active, `llm-notify` writes a pending receipt and starts a one-shot `pending-check` process.
+### Decision Table
 
-Pending behavior:
+| Event | Present | Away |
+|:------|:--------|:-----|
+| Stop, prompt explicitly asked to notify | send now | send now |
+| Stop, elapsed >= `min_elapsed` | queue | send now |
+| Stop, elapsed < `min_elapsed` | silent | silent |
+| StopFailure | queue | send now |
+| Notification: `permission_prompt` / `elicitation_dialog` | queue | send now, with cooldown |
+| Notification: `idle_prompt` and others | ignore | ignore |
+| PostToolUseFailure | count into receipt body | count into receipt body |
 
-```text
-same session continues -> cancel
-other session receives input -> defer
-no input until idle window -> send
-```
+### Delivery
 
-### Immediate Intervention Events
-
-These events bypass the idle gate:
-
-- Permission request.
-- Claude Code notification that needs attention.
-- Stop/API failure.
-- Completion with recorded tool failures.
-- Prompt explicitly asks to notify when done.
+Queued entries are sent by a singleton watcher once the user leaves, aggregated into one message. A new prompt in the session cancels its queued entries; tool activity cancels queued intervention alerts; entries expire after `notify.queue_ttl`. Every decision is appended to `state/log.jsonl`, and `llm-notify status` shows presence readings, the queue, the watcher state, and recent decisions.
 
 ### Receipt Content
 
@@ -60,7 +57,7 @@ Receipts contain only allowlisted metadata:
 - Changed file summary from Git status.
 - Tool count and failure count.
 
-Receipts do not include prompt text, model replies, command text, stdout, stderr, patch, or diff content.
+Receipts do not include prompt text, model replies, command text, stdout, stderr, patch, or diff content. Presence detection reads timestamps and an idle counter, never input content.
 
 ## Future Ideas
 
@@ -76,7 +73,7 @@ Transcript or JSONL parsing can be added later as best-effort fallback when hook
 
 Custom webhook is one-way. Two-way control requires a Feishu app bot, event subscription, and a local background service. This is a separate project scope, not part of the single-file notifier.
 
-## Not Planned for v2
+## Not Planned
 
 - Remote terminal or streaming output.
 - Web dashboard.
