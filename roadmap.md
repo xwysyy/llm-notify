@@ -1,8 +1,8 @@
 # llm-notify Roadmap
 
-## v3 Current Direction
+## v4 Current Direction
 
-`llm-notify` is a presence-gated receipt tool for Claude Code and Codex CLI.
+`llm-notify` is a presence-gated one-line notifier for Claude Code and Codex CLI.
 
 The core rule is:
 
@@ -12,18 +12,16 @@ Tell an absent user immediately.
 Never resend what the user has already seen.
 ```
 
-v3 intentionally stays small:
+v4 intentionally stays small:
 
-- Single Python file.
-- Python standard library only.
+- Single Python file, standard library only.
 - Feishu custom webhook only.
-- Hook input is the main data source.
-- No summary API.
+- Hook input is the only data source; no transcript parsing, no git calls.
+- Every message is one line: directory basename plus a state word
+  (`完成` / `需确认` / `出错`). No agent name, no duration, no file list.
 - No long-running daemon: a singleton watcher drains the queue and exits.
-- No transcript or JSONL parsing as the primary path.
-- No prompt, assistant response, command output, or diff content in Feishu messages.
 
-## Implemented v3 Model
+## Implemented v4 Model
 
 ### Presence Gate
 
@@ -31,53 +29,34 @@ Presence is the freshest of three signals: the latest `UserPromptSubmit` timesta
 
 ### Decision Table
 
-| Event | Present | Away |
-|:------|:--------|:-----|
-| Stop, prompt explicitly asked to notify | send now | send now |
-| Stop, elapsed >= `min_elapsed` | queue | send now |
-| Stop, elapsed < `min_elapsed` | silent | silent |
-| StopFailure | queue | send now |
-| Notification: `permission_prompt` / `elicitation_dialog` | queue | send now, with cooldown |
-| Notification: `idle_prompt` and others | ignore | ignore |
-| PostToolUseFailure | count into receipt body | count into receipt body |
+| Event | Behavior |
+|:------|:---------|
+| Stop, prompt explicitly asked to notify | send now |
+| Stop, elapsed >= `min_elapsed` | enqueue `完成` |
+| Stop, elapsed < `min_elapsed` | silent |
+| Notification: `permission_prompt` / `elicitation_dialog` | enqueue `需确认`, one per session, cooldown after send |
+| Notification: `idle_prompt` and others | ignore |
+| StopFailure | enqueue `出错`, same cooldown |
+| PostToolUse / PostToolUseFailure | refresh activity, cancel stale `需确认` entries |
 
 ### Delivery
 
-Queued entries are sent by a singleton watcher once the user leaves, aggregated into one message. A new prompt in the session cancels its queued entries; tool activity cancels queued intervention alerts; entries expire after `notify.queue_ttl`. Every decision is appended to `state/log.jsonl`, and `llm-notify status` shows presence readings, the queue, the watcher state, and recent decisions.
+Hooks never send; the singleton watcher is the sole sender. While the user is present it drops completions older than `notify.seen_grace` (the user watched the result). Once the user is away it waits `notify.debounce` seconds to coalesce stragglers, then sends all live entries as one single-line message, identical parts collapsed.
 
-### Receipt Content
+### Duplicate Suppression
 
-Receipts contain only allowlisted metadata:
+- A new prompt in a session cancels its queued entries; tool activity cancels queued interventions.
+- Each turn carries a fingerprint (session plus start time); a sent turn is recorded in session state and never sent again, even if a stale queue entry reappears.
+- A send timeout counts as delivered and is not retried; only failures that certainly never delivered (connection errors) retry once. An ambiguous network hiccup can lose one alert but never double it.
+- Entries expire unsent after `notify.queue_ttl`.
 
-- Tool name.
-- Configured machine label.
-- Project name.
-- Duration.
-- Trigger reason.
-- Changed file summary from Git status.
-- Tool count and failure count.
-
-Receipts do not include prompt text, model replies, command text, stdout, stderr, patch, or diff content. Presence detection reads timestamps and an idle counter, never input content.
-
-## Future Ideas
-
-### Feishu Card Format
-
-The current webhook message uses text. A future version can render the same metadata as an interactive Feishu card. This should not change privacy policy or introduce transcript summaries.
-
-### Optional Transcript Fallback
-
-Transcript or JSONL parsing can be added later as best-effort fallback when hook state is missing. It should remain a fallback and only extract metadata.
-
-### Feishu App Bot and Two-Way Control
-
-Custom webhook is one-way. Two-way control requires a Feishu app bot, event subscription, and a local background service. This is a separate project scope, not part of the single-file notifier.
+Every decision is appended to `state/log.jsonl`, and `llm-notify status` shows presence readings, the queue, the watcher state, and recent decisions.
 
 ## Not Planned
 
+- Message bodies, task summaries, or any session content in messages.
+- Feishu interactive cards: the push preview only shows title text, which the single line already fills.
+- Transcript or JSONL parsing.
 - Remote terminal or streaming output.
-- Web dashboard.
-- Account system.
-- Summary API.
-- Full transcript parsing as core logic.
+- Web dashboard, account system, summary API.
 - Long-running daemon.

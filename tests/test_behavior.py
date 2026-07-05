@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Black-box behavior tests for the llm-notify v3 decision table.
+"""Black-box behavior tests for the llm-notify v4 decision table.
 
 Drives the script only through its public surface: `event` / `watch`
 subcommands with hook JSON on stdin, plus the documented test hooks
@@ -45,14 +45,14 @@ def texts():
     return [m["content"]["text"] for m in FeishuMock.received]
 
 
-class LlmNotifyV3Test(unittest.TestCase):
+class LlmNotifyV4Test(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         with open(SCRIPT, "r", encoding="utf-8") as f:
             src = f.read()
         if "LLM_NOTIFY_STATE_DIR" not in src or "LLM_NOTIFY_FAKE_IDLE" not in src:
             raise AssertionError(
-                "llm-notify lacks the v3 test redirection hooks "
+                "llm-notify lacks the test redirection hooks "
                 "(LLM_NOTIFY_STATE_DIR / LLM_NOTIFY_FAKE_IDLE); refusing to run "
                 "against a build that would touch real config/state."
             )
@@ -70,16 +70,21 @@ class LlmNotifyV3Test(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.state = os.path.join(self.tmp, "state")
         self.config_path = os.path.join(self.tmp, "config.json")
+        self.project = os.path.basename(self.tmp)
         self.write_config()
 
     def write_config(self, **over):
         cfg = {
             "webhook": self.webhook,
             "keyword": "[AI通知]",
-            "machine_label": "testbox",
             "presence": {"away_threshold": 120, "windows_input": False},
-            "notify": {"min_elapsed": 0, "queue_ttl": 1800, "intervention_cooldown": 600},
-            "content": {"max_changed_files": 10, "include_privacy_note": True},
+            "notify": {
+                "min_elapsed": 0,
+                "queue_ttl": 1800,
+                "intervention_cooldown": 600,
+                "debounce": 0,
+                "seen_grace": 180,
+            },
         }
         for key, value in over.items():
             if isinstance(value, dict):
@@ -128,9 +133,14 @@ class LlmNotifyV3Test(unittest.TestCase):
                     entries.append(json.load(f))
         return entries
 
-    def prompt(self, sid="s1", text="do something", idle=0):
+    def prompt(self, sid="s1", text="do something", idle=0, cwd=None):
         self.event(
-            {"hook_event_name": "UserPromptSubmit", "session_id": sid, "prompt": text, "cwd": self.tmp},
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": sid,
+                "prompt": text,
+                "cwd": cwd or self.tmp,
+            },
             idle=idle,
         )
 
@@ -146,28 +156,30 @@ class LlmNotifyV3Test(unittest.TestCase):
         self.assertEqual(FeishuMock.received, [])
         self.assertEqual(self.queue(), [])
 
-    def test_present_completion_is_queued_not_sent(self):
+    def test_stop_always_queues_watcher_is_sole_sender(self):
         self.prompt()
-        self.stop(idle=0)
+        self.stop(idle=999)
         self.assertEqual(FeishuMock.received, [])
         entries = self.queue()
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0]["kind"], "completion")
+        self.watch(idle=999)
+        self.assertEqual(texts(), [f"[AI通知] {self.project} 完成"])
+        self.assertEqual(self.queue(), [])
 
-    def test_away_completion_sends_immediately(self):
+    def test_message_is_single_line_without_agent_or_paths(self):
         self.prompt()
         self.stop(idle=999)
-        self.assertEqual(len(FeishuMock.received), 1)
-        self.assertIn("任务完成", texts()[0])
-        self.assertIn("离开时完成", texts()[0])
-        self.assertIn("[AI通知]", texts()[0])
-        self.assertEqual(self.queue(), [])
+        self.watch(idle=999)
+        text = texts()[0]
+        self.assertNotIn("\n", text)
+        self.assertNotIn("Claude", text)
+        self.assertNotIn(self.tmp, text)  # basename only, never the absolute path
 
     def test_explicit_request_sends_even_when_present(self):
         self.prompt(text="跑完测试后通知我")
         self.stop(idle=0)
-        self.assertEqual(len(FeishuMock.received), 1)
-        self.assertIn("显式要求通知", texts()[0])
+        self.assertEqual(texts(), [f"[AI通知] {self.project} 完成"])
 
     def test_new_prompt_cancels_queued_completion(self):
         self.prompt()
@@ -177,32 +189,33 @@ class LlmNotifyV3Test(unittest.TestCase):
         self.assertEqual(self.queue(), [])
         self.assertEqual(FeishuMock.received, [])
 
-    def test_tool_failures_do_not_shortcircuit_and_appear_in_body(self):
-        self.prompt()
-        for _ in range(2):
-            self.event(
-                {"hook_event_name": "PostToolUseFailure", "session_id": "s1", "tool_name": "Bash"},
-                idle=0,
-            )
-        self.stop(idle=0)
-        # present + failures: still queued, NOT sent (v2 would have fired "任务存在失败")
-        self.assertEqual(FeishuMock.received, [])
-        self.assertEqual(len(self.queue()), 1)
-        self.watch(idle=999)
-        self.assertEqual(len(FeishuMock.received), 1)
-        self.assertIn("失败 2 次", texts()[0])
-
     # --- Watcher ---
 
-    def test_watcher_aggregates_multiple_sessions_into_one_message(self):
-        for sid in ("s1", "s2"):
-            self.prompt(sid=sid)
-            self.stop(sid=sid, idle=0)
+    def test_watcher_aggregates_multiple_projects_into_one_line(self):
+        proj_a = os.path.join(self.tmp, "proj-a")
+        proj_b = os.path.join(self.tmp, "proj-b")
+        os.makedirs(proj_a)
+        os.makedirs(proj_b)
+        for sid, cwd in (("s1", proj_a), ("s2", proj_b)):
+            self.prompt(sid=sid, cwd=cwd)
+            self.event({"hook_event_name": "Stop", "session_id": sid, "cwd": cwd}, idle=0)
         self.assertEqual(len(self.queue()), 2)
         self.watch(idle=999)
         self.assertEqual(len(FeishuMock.received), 1)
-        self.assertIn("2 项更新", texts()[0])
+        text = texts()[0]
+        self.assertNotIn("\n", text)
+        self.assertIn("proj-a 完成", text)
+        self.assertIn("proj-b 完成", text)
+        self.assertIn(" · ", text)
         self.assertEqual(self.queue(), [])
+
+    def test_same_project_same_state_collapses_to_one_part(self):
+        for sid in ("s1", "s2"):
+            self.prompt(sid=sid)
+            self.stop(sid=sid, idle=0)
+        self.watch(idle=999)
+        self.assertEqual(len(FeishuMock.received), 1)
+        self.assertEqual(texts()[0].count("完成"), 1)
 
     def test_expired_entries_are_dropped_not_sent(self):
         self.write_config(notify={"queue_ttl": 0})
@@ -211,6 +224,30 @@ class LlmNotifyV3Test(unittest.TestCase):
         self.assertEqual(len(self.queue()), 1)
         self.watch(idle=999)
         self.assertEqual(FeishuMock.received, [])
+        self.assertEqual(self.queue(), [])
+
+    def test_completion_watched_past_seen_grace_is_dropped(self):
+        self.write_config(notify={"seen_grace": 0})
+        self.prompt()
+        self.stop(idle=0)
+        self.assertEqual(len(self.queue()), 1)
+        # user is present at the poll and the grace window has passed: seen
+        self.watch(idle=0)
+        self.assertEqual(FeishuMock.received, [])
+        self.assertEqual(self.queue(), [])
+
+    def test_sent_turn_is_never_resent(self):
+        self.prompt()
+        self.stop(idle=999)
+        entry = self.queue()[0]
+        self.watch(idle=999)
+        self.assertEqual(len(FeishuMock.received), 1)
+        # resurrect the already-sent entry (simulates a lost-update race)
+        qdir = os.path.join(self.state, "queue")
+        with open(os.path.join(qdir, entry["id"] + ".json"), "w", encoding="utf-8") as f:
+            json.dump(entry, f)
+        self.watch(idle=999)
+        self.assertEqual(len(FeishuMock.received), 1, "same turn must not be sent twice")
         self.assertEqual(self.queue(), [])
 
     # --- Interventions ---
@@ -230,13 +267,14 @@ class LlmNotifyV3Test(unittest.TestCase):
         entries = self.queue()
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0]["kind"], "intervention")
+        self.assertEqual(entries[0]["state"], "需确认")
         self.event(
             {"hook_event_name": "PostToolUse", "session_id": "s1", "tool_name": "Bash"},
             idle=0,
         )
         self.assertEqual(self.queue(), [])
 
-    def test_permission_prompt_away_sends_with_cooldown(self):
+    def test_permission_prompt_away_sends_once_with_cooldown(self):
         self.prompt()
         payload = {
             "hook_event_name": "Notification",
@@ -245,9 +283,11 @@ class LlmNotifyV3Test(unittest.TestCase):
             "cwd": self.tmp,
         }
         self.event(payload, idle=999)
-        self.assertEqual(len(FeishuMock.received), 1)
-        self.assertIn("需要处理", texts()[0])
+        self.assertEqual(FeishuMock.received, [])
+        self.watch(idle=999)
+        self.assertEqual(texts(), [f"[AI通知] {self.project} 需确认"])
         self.event(payload, idle=999)
+        self.watch(idle=999)
         self.assertEqual(len(FeishuMock.received), 1, "cooldown should suppress the second send")
 
     def test_idle_prompt_notifications_are_ignored(self):
@@ -259,15 +299,15 @@ class LlmNotifyV3Test(unittest.TestCase):
         self.assertEqual(FeishuMock.received, [])
         self.assertEqual(self.queue(), [])
 
-    def test_stopfailure_away_sends_classified_error(self):
+    def test_stopfailure_reports_error_state(self):
         self.prompt()
         self.event(
             {"hook_event_name": "StopFailure", "session_id": "s1", "error": "rate limit exceeded"},
             idle=999,
         )
-        self.assertEqual(len(FeishuMock.received), 1)
-        self.assertIn("需要处理", texts()[0])
-        self.assertIn("rate_limit", texts()[0])
+        self.assertEqual(FeishuMock.received, [])
+        self.watch(idle=999)
+        self.assertEqual(texts(), [f"[AI通知] {self.project} 出错"])
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@
 <p align="center">
   <h1 align="center">llm-notify</h1>
   <p align="center">
-    <b>Claude Code & Codex CLI 飞书任务回执</b>
+    <b>Claude Code & Codex CLI 单行飞书提醒</b>
   </p>
   <p align="center">
     中文文档 &nbsp;|&nbsp; <a href="./README.md">English</a>
@@ -14,7 +14,15 @@
 
 ---
 
-`llm-notify` 在 Claude Code 或 Codex 任务结束、或卡在等你确认时发送飞书回执。是否送达由在场检测决定：用键盘鼠标信号判断你是否在电脑前，你盯着任务跑完时不会被打扰，真正离开后消息立刻送到。
+`llm-notify` 在 Claude Code 或 Codex 任务结束、或卡在等你确认时发送飞书提醒。每条消息只有一行：工作目录名加一个状态词，手机推送预览本身就是全部内容：
+
+```text
+[AI通知] llm-notify 完成
+[AI通知] data-pipeline 需确认
+[AI通知] proj-a 完成 · proj-b 出错
+```
+
+是否送达由在场检测决定：用键盘鼠标信号判断你是否在电脑前，你盯着任务跑完时不会被打扰，真正离开后消息立刻送到。
 
 核心规则：在场永不打扰，离开立即知道，看过的永不补发。
 
@@ -22,33 +30,36 @@
 
 在场状态取三个信号中最新的一个：最近一次 `UserPromptSubmit` 的时间、`/dev/pts` 终端键盘活动时间，以及 WSL 下通过 `GetLastInputInfo` 读取的 Windows 全局键鼠空闲。所有信号静默超过 `presence.away_threshold` 秒（默认 120）即视为离开。某个信号不可用时自动退化到其余信号。
 
+hook 只记录状态和入队，从不直接发送；watcher 是唯一发送点。
+
 ```text
 UserPromptSubmit
   记录最近人工输入时间
-  开启新 turn 并记录 Git baseline
-  取消该会话排队中的回执（你回来了）
+  取消该会话排队中的提醒（你回来了）
+  开启新 turn
 
 PostToolUse / PostToolUseFailure
-  累计工具次数与失败次数，收集安全的文件路径候选
-  清除排队中的干预提醒（会话又跑起来了）
+  刷新会话活动时间
+  清除排队中的待确认提醒（会话又跑起来了）
 
 Stop
-  离开    立即发送完成回执
-  在场    回执进入队列交给 watcher
   耗时低于 notify.min_elapsed 的 turn 保持静默
+  否则一条「完成」进入队列
 
-Notification（permission_prompt / elicitation_dialog）与 StopFailure
-  离开    立即发送干预提醒，带冷却
-  在场    进入队列；会话后续有工具活动则取消
+Notification（permission_prompt / elicitation_dialog）-> 「需确认」
+StopFailure                                          -> 「出错」
+  每会话同时只挂一条，发送后有冷却
   idle_prompt 等其他通知类型一律忽略
 
 watch（单例，队列空了自动退出）
   每 30 秒检测一次在场状态
-  会话已继续的条目取消，超时条目作废
-  检测到你离开后，把所有待发内容合并成一条消息发出
+  你在场时：完成条目排队超过 notify.seen_grace 秒即丢弃
+    （你一直在机器前，结果已经看过了）
+  你离开后：先等 notify.debounce 秒收拢陆续完成的任务，
+    再把所有待发内容合并成一行发出
 ```
 
-你在场时入队的回执由 watcher 在你离开后送达，多个任务先后完成会聚合为一条消息。回到某个会话继续对话会取消它排队中的回执，超过 `notify.queue_ttl` 未送出的条目自动作废。工具调用失败只写进回执正文，不再单独触发通知。每个决策都追加到 `state/log.jsonl`，可用 `llm-notify status` 查看。
+三条规则挡住重复提醒。完成后你继续在场超过 `notify.seen_grace` 秒的条目按已看过丢弃；每个 turn 带指纹，发过一次的永不再发；发送超时按已送达处理而不重试，网络抖动最多丢一条，绝不重复推送。每个决策都追加到 `state/log.jsonl`，可用 `llm-notify status` 查看。
 
 ## 快速开始
 
@@ -74,7 +85,7 @@ chmod +x ~/.llm-notify/llm-notify
 ~/.llm-notify/llm-notify init
 ```
 
-按提示输入 Webhook URL、Secret、关键词、机器标签和离开阈值，最后会打印一次在场信号自检，确认各信号在你机器上有效。
+按提示输入 Webhook URL、Secret、关键词和离开阈值，最后会打印一次在场信号自检，确认各信号在你机器上有效。
 
 ### 4. 验证连通性
 
@@ -99,7 +110,6 @@ chmod +x ~/.llm-notify/llm-notify
   "webhook": "https://open.feishu.cn/open-apis/bot/.../xxxxxxxx",
   "secret": "your-secret",
   "keyword": "[AI通知]",
-  "machine_label": "autodl-box",
   "presence": {
     "away_threshold": 120,
     "windows_input": true
@@ -107,12 +117,9 @@ chmod +x ~/.llm-notify/llm-notify
   "notify": {
     "min_elapsed": 45,
     "queue_ttl": 1800,
-    "intervention_cooldown": 600
-  },
-  "content": {
-    "max_changed_files": 10,
-    "path_mode": "project",
-    "include_privacy_note": true
+    "intervention_cooldown": 600,
+    "debounce": 60,
+    "seen_grace": 180
   }
 }
 ```
@@ -122,15 +129,13 @@ chmod +x ~/.llm-notify/llm-notify
 | `webhook` | 飞书自定义机器人 Webhook 地址 |
 | `secret` | 签名校验密钥，可为空 |
 | `keyword` | 飞书关键词安全校验用前缀 |
-| `machine_label` | 通知里的机器标签，不使用真实 hostname |
 | `presence.away_threshold` | 键鼠静默多少秒视为离开 |
 | `presence.windows_input` | WSL 下是否使用 Windows 全局键鼠空闲信号 |
 | `notify.min_elapsed` | 耗时低于该秒数的 turn 不通知 |
-| `notify.queue_ttl` | 排队回执超过该秒数未送出则作废 |
-| `notify.intervention_cooldown` | 同一会话两次干预提醒的最小间隔秒数 |
-| `content.max_changed_files` | 通知最多展示多少个改动文件 |
-| `content.path_mode` | 使用 `project` 时显示项目名和相对路径 |
-| `content.include_privacy_note` | 是否显示隐私说明 |
+| `notify.queue_ttl` | 排队提醒超过该秒数未送出则作废 |
+| `notify.intervention_cooldown` | 同一会话两次待确认提醒的最小间隔秒数 |
+| `notify.debounce` | 离开后 watcher 先等待该秒数收拢陆续完成的任务再发送 |
+| `notify.seen_grace` | 完成后你继续在场超过该秒数，该条按已看过丢弃 |
 
 ## Hook 配置
 
@@ -168,32 +173,15 @@ hooks = true
 
 Codex 中需要运行 `/hooks` review/trust 这些命令 hook。
 
-## 通知示例
+## 消息格式
 
-单条回执：
-
-```text
-[AI通知] Claude Code 任务完成
-工具: Claude Code
-机器: autodl-box
-项目: llm-notify
-耗时: 6分18秒
-触发: 离开时完成
-改动文件:
-- llm-notify
-- README_CN.md
-执行: 工具 5 次，失败 0 次
-隐私: 未发送 prompt、回复正文、命令输出、diff 内容
-```
-
-离开前有多个任务先后完成时，watcher 聚合为一条：
+会话 cwd 的目录名，加空格，加三个状态词之一：`完成`（任务结束）、`需确认`（等待权限或 MCP 确认）、`出错`（该 turn 失败）。多个待发条目用 `·` 合并为一行，内容相同的条目只保留一个。
 
 ```text
-[AI通知] 离开期间 2 项更新
-机器: autodl-box
-1. Claude Code 任务完成 · llm-notify · 9分30秒 · 改动 3 个文件
-2. Codex 需要处理 · data-pipeline · 权限确认
-隐私: 未发送 prompt、回复正文、命令输出、diff 内容
+[AI通知] llm-notify 完成
+[AI通知] llm-notify 需确认
+[AI通知] llm-notify 出错
+[AI通知] llm-notify 完成 · data-pipeline 需确认
 ```
 
 ## 命令
@@ -209,28 +197,17 @@ Codex 中需要运行 `/hooks` review/trust 这些命令 hook。
 
 ## 隐私策略
 
-默认不会发送：
-
-- 用户 prompt。
-- 模型最终回复。
-- Codex input messages。
-- 命令文本。
-- stdout / stderr。
-- patch / diff。
-- 完整绝对路径。
-- 真实 hostname。
-
-通知只使用 allowlist 元数据：工具、机器标签、项目名、耗时、触发原因、改动文件相对路径、工具次数、失败次数。在场检测只读时间戳和空闲秒数，不读取任何输入内容。
+离开这台机器的会话数据只有目录名和一个状态词。消息不含 prompt、模型回复、命令文本、输出、diff、绝对路径和 hostname。在场检测只读时间戳和空闲秒数，不读取任何输入内容。
 
 ## 常见问题
 
 | 现象 | 排查方法 |
 |:-----|:---------|
-| 没收到回执 | 运行 `llm-notify status`，查看在场判定、队列内容和最近决策 |
-| 回执比预期晚 | watcher 每 30 秒轮询一次，且需要键鼠静默满 `away_threshold` 秒 |
+| 没收到提醒 | 运行 `llm-notify status`，查看在场判定、队列内容和最近决策 |
+| 提醒比预期晚 | 需要键鼠静默满 `away_threshold` 秒，再等 `notify.debounce` 秒收拢；watcher 每 30 秒轮询一次 |
+| 某次完成没有提醒 | 完成后你在机器前停留超过 `notify.seen_grace` 秒，该条按已看过丢弃（日志中 `cancelled/seen`） |
 | 短任务从不通知 | 耗时低于 `notify.min_elapsed` 秒的 turn 按设计静默 |
 | Codex hook 未触发 | 运行 `/hooks` review/trust，并确认 hooks 未被禁用 |
-| 改动文件不完整 | Git status 是工作区提示，不是严格审计；脏文件或未跟踪文件超过 5000 个的工作区会标记为不可判定 |
 
 ## 开发
 

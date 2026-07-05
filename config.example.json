@@ -2,13 +2,15 @@
   "webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
   "secret": "your-signing-secret",
   "keyword": "[AI通知]",
-  "machine_label": "autodl-box",
-  "activity": {
-    "idle_window": 300
+  "presence": {
+    "away_threshold": 120,
+    "windows_input": true
   },
-  "content": {
-    "max_changed_files": 10,
-    "path_mode": "project",
-    "include_privacy_note": true
+  "notify": {
+    "min_elapsed": 45,
+    "queue_ttl": 1800,
+    "intervention_cooldown": 600,
+    "debounce": 60,
+    "seen_grace": 180
   }
 }

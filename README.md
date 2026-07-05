@@ -5,7 +5,7 @@
 <p align="center">
   <h1 align="center">llm-notify</h1>
   <p align="center">
-    <b>Feishu task receipts for Claude Code & Codex CLI</b>
+    <b>One-line Feishu alerts for Claude Code & Codex CLI</b>
   </p>
   <p align="center">
     <a href="./README_CN.md">中文文档</a> &nbsp;|&nbsp; English
@@ -14,7 +14,15 @@
 
 ---
 
-`llm-notify` sends a Feishu receipt when Claude Code or Codex finishes a task or gets stuck waiting for you. Delivery is gated by presence detection: keyboard and mouse signals decide whether you are at the machine, so a finished task does not buzz you while you are watching it run, and reaches you once you are actually away.
+`llm-notify` sends a one-line Feishu message when Claude Code or Codex finishes a task or gets stuck waiting for you. Each message is just the working directory name plus a state word, so the push preview on your phone already tells you everything:
+
+```text
+[AI通知] llm-notify 完成
+[AI通知] data-pipeline 需确认
+[AI通知] proj-a 完成 · proj-b 出错
+```
+
+Delivery is gated by presence detection: keyboard and mouse signals decide whether you are at the machine, so a finished task does not buzz you while you are watching it run, and reaches you once you are actually away.
 
 Core rule: never disturb a present user, tell an absent user immediately, never resend what the user has already seen.
 
@@ -22,33 +30,36 @@ Core rule: never disturb a present user, tell an absent user immediately, never 
 
 Presence is the freshest of three signals: the latest `UserPromptSubmit` timestamp, terminal keyboard activity from `/dev/pts` access times, and (under WSL) Windows global keyboard/mouse idle via `GetLastInputInfo`. You count as away once all signals stay silent for `presence.away_threshold` seconds (default 120). An unavailable signal degrades silently to the remaining ones.
 
+Hooks never send directly; they only record state and enqueue. The watcher is the sole sender.
+
 ```text
 UserPromptSubmit
   records the latest human input time
-  starts a new turn with a Git baseline
-  cancels queued receipts for this session (you are back)
+  cancels queued alerts for this session (you are back)
+  starts a new turn
 
 PostToolUse / PostToolUseFailure
-  counts tool calls and failures, collects safe file path candidates
+  refreshes session activity
   clears queued intervention alerts (the session is running again)
 
 Stop
-  away    sends the completion receipt immediately
-  present queues the receipt for the watcher
   turns shorter than notify.min_elapsed stay silent
+  otherwise a "完成" entry joins the queue
 
-Notification (permission_prompt / elicitation_dialog) and StopFailure
-  away    sends an intervention alert immediately, with a cooldown
-  present queues it; later tool activity in the session cancels it
+Notification (permission_prompt / elicitation_dialog) -> "需确认"
+StopFailure                                           -> "出错"
+  one pending alert per session, with a cooldown after each send
   idle_prompt and other notification types are ignored
 
 watch (singleton, exits when the queue is empty)
   polls presence every 30 seconds
-  cancels entries whose session has continued, drops expired entries
-  once you are away, sends everything in one aggregated message
+  while you are present: drops completions older than notify.seen_grace
+    (you were at the machine, you saw the result)
+  once you are away: waits notify.debounce seconds for stragglers,
+    then sends everything as one single-line message
 ```
 
-Receipts queued while you are present are delivered by the watcher after you leave, aggregated into a single message when several tasks finished. Returning to a session cancels its queued receipts, and entries older than `notify.queue_ttl` expire unsent. Tool failures are reported inside the receipt body instead of triggering a notification by themselves. Every decision is appended to `state/log.jsonl` and shown by `llm-notify status`.
+Three rules keep duplicates out. A completion you watched for more than `notify.seen_grace` seconds is dropped as already seen. Every turn carries a fingerprint, and a turn that was sent once is never sent again. A send that times out counts as delivered instead of being retried, so an ambiguous network hiccup can lose one alert but never double it. Every decision is appended to `state/log.jsonl` and shown by `llm-notify status`.
 
 ## Quick Start
 
@@ -74,7 +85,7 @@ Use the Feishu desktop app.
 ~/.llm-notify/llm-notify init
 ```
 
-The prompt asks for the webhook, secret, keyword, machine label, and away threshold, then prints a presence self-check so you can confirm the signals work on your machine.
+The prompt asks for the webhook, secret, keyword, and away threshold, then prints a presence self-check so you can confirm the signals work on your machine.
 
 ### 4. Test Connectivity
 
@@ -99,7 +110,6 @@ The command prints Claude Code and Codex hook snippets.
   "webhook": "https://open.feishu.cn/open-apis/bot/.../xxxxxxxx",
   "secret": "your-secret",
   "keyword": "[AI通知]",
-  "machine_label": "autodl-box",
   "presence": {
     "away_threshold": 120,
     "windows_input": true
@@ -107,12 +117,9 @@ The command prints Claude Code and Codex hook snippets.
   "notify": {
     "min_elapsed": 45,
     "queue_ttl": 1800,
-    "intervention_cooldown": 600
-  },
-  "content": {
-    "max_changed_files": 10,
-    "path_mode": "project",
-    "include_privacy_note": true
+    "intervention_cooldown": 600,
+    "debounce": 60,
+    "seen_grace": 180
   }
 }
 ```
@@ -122,15 +129,13 @@ The command prints Claude Code and Codex hook snippets.
 | `webhook` | Feishu custom bot webhook URL |
 | `secret` | Optional signing secret |
 | `keyword` | Keyword prefix for Feishu keyword verification |
-| `machine_label` | Label shown in receipts instead of the real hostname |
 | `presence.away_threshold` | Seconds of keyboard/mouse silence before you count as away |
 | `presence.windows_input` | Use Windows global input idle under WSL |
 | `notify.min_elapsed` | Turns shorter than this many seconds never notify |
-| `notify.queue_ttl` | Queued receipts expire unsent after this many seconds |
+| `notify.queue_ttl` | Queued alerts expire unsent after this many seconds |
 | `notify.intervention_cooldown` | Minimum seconds between intervention alerts per session |
-| `content.max_changed_files` | Maximum changed files to show |
-| `content.path_mode` | `project` shows project name and relative paths |
-| `content.include_privacy_note` | Whether to include the privacy note |
+| `notify.debounce` | Seconds the watcher waits after the newest entry before sending, to coalesce near-simultaneous finishes |
+| `notify.seen_grace` | A completion you stayed present past this many seconds is dropped as already seen |
 
 ## Hook Setup
 
@@ -168,32 +173,15 @@ hooks = true
 
 Run `/hooks` in Codex to review and trust the command hooks.
 
-## Notification Examples
+## Message Format
 
-A single receipt:
-
-```text
-[AI通知] Claude Code 任务完成
-工具: Claude Code
-机器: autodl-box
-项目: llm-notify
-耗时: 6分18秒
-触发: 离开时完成
-改动文件:
-- llm-notify
-- README.md
-执行: 工具 5 次，失败 0 次
-隐私: 未发送 prompt、回复正文、命令输出、diff 内容
-```
-
-Several tasks finished before you left, aggregated by the watcher:
+The directory basename of the session's cwd, a space, and one of three state words: `完成` (task finished), `需确认` (waiting for a permission or MCP confirmation), `出错` (the turn failed). Multiple pending items are joined with `·` into one line; identical items collapse into one.
 
 ```text
-[AI通知] 离开期间 2 项更新
-机器: autodl-box
-1. Claude Code 任务完成 · llm-notify · 9分30秒 · 改动 3 个文件
-2. Codex 需要处理 · data-pipeline · 权限确认
-隐私: 未发送 prompt、回复正文、命令输出、diff 内容
+[AI通知] llm-notify 完成
+[AI通知] llm-notify 需确认
+[AI通知] llm-notify 出错
+[AI通知] llm-notify 完成 · data-pipeline 需确认
 ```
 
 ## Commands
@@ -209,28 +197,17 @@ Several tasks finished before you left, aggregated by the watcher:
 
 ## Privacy
 
-Feishu messages use metadata only and exclude:
-
-- User prompt.
-- Assistant final response.
-- Codex input messages.
-- Command text.
-- stdout / stderr.
-- patch / diff.
-- Full absolute cwd.
-- Real hostname.
-
-Receipts only use allowlisted metadata: tool, machine label, project name, duration, trigger reason, relative changed file paths, tool count, and failure count. Presence detection reads timestamps and an idle counter, never input content.
+The only session data that ever leaves the machine is the directory basename and a state word. Messages contain no prompt text, no model replies, no command text, no output, no diff, no absolute paths, and no hostname. Presence detection reads timestamps and an idle counter, never input content.
 
 ## Troubleshooting
 
 | Symptom | Check |
 |:--------|:------|
-| No receipt arrived | Run `llm-notify status`: check the away verdict, queue contents, and recent decisions |
-| Receipt arrived later than expected | The watcher polls every 30 seconds and waits for `away_threshold` seconds of silence |
+| No alert arrived | Run `llm-notify status`: check the away verdict, queue contents, and recent decisions |
+| Alert arrived later than expected | The watcher waits for `away_threshold` seconds of silence, then `notify.debounce` more to coalesce; polls run every 30 seconds |
+| A completion never arrived | If you stayed at the machine past `notify.seen_grace` seconds, it was dropped as already seen (`cancelled/seen` in the log) |
 | Short tasks never notify | Turns under `notify.min_elapsed` seconds are silent by design |
 | Codex hook missing | Run `/hooks` review/trust and confirm hooks are enabled |
-| Changed files look incomplete | Git status is a worktree hint, not an audit trail; worktrees with more than 5000 dirty or untracked files are reported as undeterminable |
 
 ## Development
 
