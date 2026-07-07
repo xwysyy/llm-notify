@@ -84,6 +84,9 @@ class LlmNotifyV4Test(unittest.TestCase):
                 "intervention_cooldown": 600,
                 "debounce": 0,
                 "seen_grace": 180,
+                # off by default in tests: pending reminders keep the watcher
+                # alive, which would hang tests that drain the queue
+                "reply_reminders": [],
             },
         }
         for key, value in over.items():
@@ -298,6 +301,152 @@ class LlmNotifyV4Test(unittest.TestCase):
         )
         self.assertEqual(FeishuMock.received, [])
         self.assertEqual(self.queue(), [])
+
+    # --- Reply reminders ---
+
+    def session_files(self):
+        sdir = os.path.join(self.state, "sessions")
+        return [os.path.join(sdir, n) for n in os.listdir(sdir)]
+
+    def patch_sessions(self, **fields):
+        for path in self.session_files():
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            data.update(fields)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+
+    def test_stop_schedules_reply_reminders(self):
+        self.write_config(notify={"reply_reminders": [2400, 3000]})
+        self.prompt()
+        self.stop(idle=0)
+        reminders = [e for e in self.queue() if e["kind"] == "reminder"]
+        self.assertEqual(len(reminders), 2)
+        self.assertEqual(
+            {r["state"] for r in reminders}, {"40分钟未回复", "50分钟未回复"}
+        )
+        offsets = sorted(r["fire_at"] - r["created_at"] for r in reminders)
+        self.assertEqual(offsets, [2400.0, 3000.0])
+
+    def test_intervention_schedules_reply_reminders(self):
+        self.write_config(notify={"reply_reminders": [2400]})
+        self.prompt()
+        self.event(
+            {
+                "hook_event_name": "Notification",
+                "session_id": "s1",
+                "notification_type": "permission_prompt",
+                "cwd": self.tmp,
+            },
+            idle=0,
+        )
+        kinds = sorted(e["kind"] for e in self.queue())
+        self.assertEqual(kinds, ["intervention", "reminder"])
+
+    def test_new_prompt_cancels_reminders(self):
+        self.write_config(notify={"reply_reminders": [2400]})
+        self.prompt()
+        self.stop(idle=0)
+        self.assertTrue(any(e["kind"] == "reminder" for e in self.queue()))
+        self.prompt(text="reply arrived")
+        self.assertEqual([e for e in self.queue() if e["kind"] == "reminder"], [])
+
+    def test_tool_activity_cancels_reminders_via_sweep(self):
+        self.write_config(notify={"reply_reminders": [2400]})
+        self.prompt()
+        self.event(
+            {
+                "hook_event_name": "Notification",
+                "session_id": "s1",
+                "notification_type": "permission_prompt",
+                "cwd": self.tmp,
+            },
+            idle=0,
+        )
+        self.event(
+            {"hook_event_name": "PostToolUse", "session_id": "s1", "tool_name": "Bash"},
+            idle=0,
+        )
+        self.watch(idle=0)
+        self.assertEqual(FeishuMock.received, [])
+        self.assertEqual(self.queue(), [])
+
+    def test_due_reminder_sends_even_when_present(self):
+        self.write_config(notify={"reply_reminders": [0], "min_elapsed": 3600})
+        self.prompt()
+        self.stop(idle=0)
+        self.assertEqual([e["kind"] for e in self.queue()], ["reminder"])
+        # idle=0: user is at the keyboard, yet the reminder must go out
+        self.watch(idle=0)
+        self.assertEqual(texts(), [f"[AI通知] {self.project} 0分钟未回复"])
+        self.assertEqual(self.queue(), [])
+
+    def test_session_end_cancels_all_pending_entries(self):
+        self.write_config(notify={"reply_reminders": [2400]})
+        self.prompt()
+        self.stop(idle=0)
+        self.assertNotEqual(self.queue(), [])
+        self.event(
+            {
+                "hook_event_name": "SessionEnd",
+                "session_id": "s1",
+                "reason": "prompt_input_exit",
+                "cwd": self.tmp,
+            }
+        )
+        self.assertEqual(self.queue(), [])
+        self.assertEqual(FeishuMock.received, [])
+
+    def test_dead_claude_process_cancels_reminder(self):
+        self.write_config(notify={"reply_reminders": [0], "min_elapsed": 3600})
+        self.prompt()
+        self.stop(idle=0)
+        # live pid but wrong start time: the recorded process is gone (pid reused)
+        self.patch_sessions(agent_pid=os.getpid(), agent_pid_start="0")
+        self.watch(idle=0)
+        self.assertEqual(FeishuMock.received, [])
+        self.assertEqual(self.queue(), [])
+
+    def test_live_claude_process_keeps_reminder(self):
+        self.write_config(notify={"reply_reminders": [0], "min_elapsed": 3600})
+        self.prompt()
+        self.stop(idle=0)
+        with open(f"/proc/{os.getpid()}/stat", encoding="utf-8") as f:
+            start = f.read().rpartition(")")[2].split()[19]
+        self.patch_sessions(agent_pid=os.getpid(), agent_pid_start=start)
+        self.watch(idle=0)
+        self.assertEqual(texts(), [f"[AI通知] {self.project} 0分钟未回复"])
+
+    def test_sent_reminder_is_never_resent(self):
+        self.write_config(notify={"reply_reminders": [0], "min_elapsed": 3600})
+        self.prompt()
+        self.stop(idle=0)
+        entry = self.queue()[0]
+        self.watch(idle=0)
+        self.assertEqual(len(FeishuMock.received), 1)
+        qdir = os.path.join(self.state, "queue")
+        with open(os.path.join(qdir, entry["id"] + ".json"), "w", encoding="utf-8") as f:
+            json.dump(entry, f)
+        self.watch(idle=0)
+        self.assertEqual(len(FeishuMock.received), 1, "same reminder must not be sent twice")
+        self.assertEqual(self.queue(), [])
+
+    def test_codex_sessions_get_no_reminders(self):
+        self.write_config(notify={"reply_reminders": [2400]})
+        self.event(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "c1",
+                "prompt": "do something",
+                "cwd": self.tmp,
+            },
+            tool="codex",
+        )
+        self.event(
+            {"hook_event_name": "Stop", "session_id": "c1", "cwd": self.tmp},
+            tool="codex",
+        )
+        self.assertEqual([e["kind"] for e in self.queue()], ["completion"])
 
     def test_stopfailure_reports_error_state(self):
         self.prompt()

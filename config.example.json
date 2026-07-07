@@ -11,6 +11,8 @@
     "queue_ttl": 1800,
     "intervention_cooldown": 600,
     "debounce": 60,
-    "seen_grace": 180
+    "seen_grace": 180,
+    "cache_ttl": 3600,
+    "reply_reminders": [2400, 3000]
   }
 }

@@ -26,6 +26,12 @@ Delivery is gated by presence detection: keyboard and mouse signals decide wheth
 
 Core rule: never disturb a present user, tell an absent user immediately, never resend what the user has already seen.
 
+The one exception is reply reminders. Claude Code's model cache expires about an hour after the last activity, and replying after that reprocesses the whole context at full price. So when a Claude session stops and you have not replied, llm-notify pings you at 40 and 50 minutes by default, in time to get back before the cache dies. Replying, closing the session, or the claude process exiting cancels the reminders. These reminders ignore presence on purpose: their audience is you, at the machine, busy with something else.
+
+```text
+[AI通知] llm-notify 40分钟未回复
+```
+
 ## How It Works
 
 Presence is the freshest of three signals: the latest `UserPromptSubmit` timestamp, terminal keyboard activity from `/dev/pts` access times, and (under WSL) Windows global keyboard/mouse idle via `GetLastInputInfo`. You count as away once all signals stay silent for `presence.away_threshold` seconds (default 120). An unavailable signal degrades silently to the remaining ones.
@@ -45,14 +51,22 @@ PostToolUse / PostToolUseFailure
 Stop
   turns shorter than notify.min_elapsed stay silent
   otherwise a "完成" entry joins the queue
+  claude sessions also schedule the notify.reply_reminders tiers
 
 Notification (permission_prompt / elicitation_dialog) -> "需确认"
 StopFailure                                           -> "出错"
   one pending alert per session, with a cooldown after each send
   idle_prompt and other notification types are ignored
+  claude sessions refresh the reply reminders too
+    (a session stuck on a prompt burns cache all the same)
+
+SessionEnd (claude only)
+  marks the session closed, cancels all of its queued entries
 
 watch (singleton, exits when the queue is empty)
   polls presence every 30 seconds
+  due reply reminders go out regardless of presence, after checking
+    the session has no reply, is not closed, and claude is still alive
   while you are present: drops completions older than notify.seen_grace
     (you were at the machine, you saw the result)
   once you are away: waits notify.debounce seconds for stragglers,
@@ -119,7 +133,9 @@ The command prints Claude Code and Codex hook snippets.
     "queue_ttl": 1800,
     "intervention_cooldown": 600,
     "debounce": 60,
-    "seen_grace": 180
+    "seen_grace": 180,
+    "cache_ttl": 3600,
+    "reply_reminders": [2400, 3000]
   }
 }
 ```
@@ -136,6 +152,8 @@ The command prints Claude Code and Codex hook snippets.
 | `notify.intervention_cooldown` | Minimum seconds between intervention alerts per session |
 | `notify.debounce` | Seconds the watcher waits after the newest entry before sending, to coalesce near-simultaneous finishes |
 | `notify.seen_grace` | A completion you stayed present past this many seconds is dropped as already seen |
+| `notify.cache_ttl` | Model cache lifetime in seconds; reply reminders expire unsent past it |
+| `notify.reply_reminders` | Seconds after a claude session stops before each unreplied reminder; empty list disables |
 
 ## Hook Setup
 
@@ -150,9 +168,10 @@ PostToolUseFailure
 Notification
 StopFailure
 Stop
+SessionEnd
 ```
 
-Run `llm-notify install` for the full JSON snippet.
+Run `llm-notify install` for the full JSON snippet. `SessionEnd` lets reply reminders detect a manually closed session (`/exit`, Ctrl+D, `/clear`, ...); without it only the process-liveness check catches closed sessions.
 
 ### Codex CLI
 
@@ -175,12 +194,13 @@ Run `/hooks` in Codex to review and trust the command hooks.
 
 ## Message Format
 
-The directory basename of the session's cwd, a space, and one of three state words: `完成` (task finished), `需确认` (waiting for a permission or MCP confirmation), `出错` (the turn failed). Multiple pending items are joined with `·` into one line; identical items collapse into one.
+The directory basename of the session's cwd, a space, and a state word: `完成` (task finished), `需确认` (waiting for a permission or MCP confirmation), `出错` (the turn failed), or `40分钟未回复` (reply reminder; minutes follow the configured tier). Multiple pending items are joined with `·` into one line; identical items collapse into one.
 
 ```text
 [AI通知] llm-notify 完成
 [AI通知] llm-notify 需确认
 [AI通知] llm-notify 出错
+[AI通知] llm-notify 40分钟未回复
 [AI通知] llm-notify 完成 · data-pipeline 需确认
 ```
 
@@ -207,6 +227,8 @@ The only session data that ever leaves the machine is the directory basename and
 | Alert arrived later than expected | The watcher waits for `away_threshold` seconds of silence, then `notify.debounce` more to coalesce; polls run every 30 seconds |
 | A completion never arrived | If you stayed at the machine past `notify.seen_grace` seconds, it was dropped as already seen (`cancelled/seen` in the log) |
 | Short tasks never notify | Turns under `notify.min_elapsed` seconds are silent by design |
+| Reminder arrived for a closed session | Killing the terminal skips `SessionEnd`; the pre-send liveness check normally cancels these (`cancelled/session_gone` in the log). If it recurs, confirm the SessionEnd hook is configured |
+| Don't want reply reminders | Set `notify.reply_reminders` to `[]` |
 | Codex hook missing | Run `/hooks` review/trust and confirm hooks are enabled |
 
 ## Development

@@ -12,14 +12,23 @@ Tell an absent user immediately.
 Never resend what the user has already seen.
 ```
 
+One deliberate exception: reply reminders (below) bypass the presence gate,
+because their audience is a present-but-busy user and the cost of a missed
+reminder (a full-price cache rebuild) outweighs one extra one-line ping.
+
 v4 intentionally stays small:
 
 - Single Python file, standard library only.
 - Feishu custom webhook only.
 - Hook input is the only data source; no transcript parsing, no git calls.
+  (Exception: reply reminders read `/proc` to verify the claude process is
+  still alive before sending.)
 - Every message is one line: directory basename plus a state word
-  (`完成` / `需确认` / `出错`). No agent name, no duration, no file list.
+  (`完成` / `需确认` / `出错` / `N分钟未回复`). No agent name, no duration,
+  no file list.
 - No long-running daemon: a singleton watcher drains the queue and exits.
+  (Pending reply reminders keep it alive until they fire or cancel, at most
+  `notify.cache_ttl` after the anchor.)
 
 ## Implemented v4 Model
 
@@ -38,10 +47,33 @@ Presence is the freshest of three signals: the latest `UserPromptSubmit` timesta
 | Notification: `idle_prompt` and others | ignore |
 | StopFailure | enqueue `出错`, same cooldown |
 | PostToolUse / PostToolUseFailure | refresh activity, cancel stale `需确认` entries |
+| Stop / intervention (claude only) | (re)schedule `notify.reply_reminders` tiers anchored at the event |
+| SessionEnd (claude only) | mark session closed, cancel all of its queued entries |
 
 ### Delivery
 
 Hooks never send; the singleton watcher is the sole sender. While the user is present it drops completions older than `notify.seen_grace` (the user watched the result). Once the user is away it waits `notify.debounce` seconds to coalesce stragglers, then sends all live entries as one single-line message, identical parts collapsed.
+
+### Reply Reminders (cache expiry)
+
+Claude Code's prompt cache expires `notify.cache_ttl` (default 3600s) after the
+last model activity; replying later reprocesses the whole context at full
+price. When a claude session stops or gets stuck on a confirmation, llm-notify
+schedules one reminder per `notify.reply_reminders` tier (default 40 and 50
+minutes), anchored at that event. Codex sessions are excluded by design (cost
+profile does not justify it).
+
+A reminder is cancelled if, before it fires, the session sees a new prompt or
+tool activity, a `SessionEnd` hook marks it closed (`/exit`, Ctrl+D, `/clear`,
+logout, resume), or the claude process recorded at prompt time is gone. The
+process check walks `/proc/<pid>` with a start-time comparison to defeat pid
+reuse; it exists because SessionEnd never fires when the terminal is killed
+outright. If the pid was never captured (no `/proc`, unexpected process tree),
+the check degrades to "assume alive" rather than suppressing reminders.
+
+Due reminders are the only messages sent while the user is present. Each
+carries a fingerprint (`last_sent_reminder_at`) so a crash between send and
+dequeue cannot double-send.
 
 ### Duplicate Suppression
 

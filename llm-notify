@@ -153,6 +153,8 @@ def default_config():
             "intervention_cooldown": 600,
             "debounce": 60,
             "seen_grace": 180,
+            "cache_ttl": 3600,
+            "reply_reminders": [2400, 3000],
         },
     }
 
@@ -184,8 +186,9 @@ def load_config(required=True):
         for key, value in defaults[section].items():
             cfg[section].setdefault(key, value)
     cfg["presence"]["away_threshold"] = int(cfg["presence"]["away_threshold"])
-    for key in ("min_elapsed", "queue_ttl", "intervention_cooldown", "debounce", "seen_grace"):
+    for key in ("min_elapsed", "queue_ttl", "intervention_cooldown", "debounce", "seen_grace", "cache_ttl"):
         cfg["notify"][key] = int(cfg["notify"][key])
+    cfg["notify"]["reply_reminders"] = [int(v) for v in cfg["notify"]["reply_reminders"]]
     return cfg
 
 
@@ -352,6 +355,46 @@ def is_away(config):
     return presence_idle(config) >= config["presence"]["away_threshold"]
 
 
+# --- claude process liveness ---
+# SessionEnd never fires when the terminal is killed outright, so reply
+# reminders also verify the claude process recorded at prompt time is
+# still alive before going out. Start time guards against pid reuse.
+
+
+def proc_stat_fields(pid):
+    with open(f"/proc/{int(pid)}/stat", "r", encoding="ascii") as f:
+        stat = f.read()
+    return stat.rpartition(")")[2].split()  # [0]=state [1]=ppid [19]=starttime
+
+
+def find_agent_pid():
+    pid = os.getppid()
+    for _ in range(10):
+        if pid <= 1:
+            return None
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                argv0 = f.read().split(b"\0", 1)[0].decode("utf-8", "replace")
+            fields = proc_stat_fields(pid)
+        except (OSError, IndexError, ValueError):
+            return None
+        if os.path.basename(argv0) == "claude":
+            return pid, fields[19]
+        pid = int(fields[1])
+    return None
+
+
+def agent_alive(session):
+    pid = session.get("agent_pid")
+    if not pid:
+        return True  # never captured (e.g. no /proc); SessionEnd still covers
+    try:
+        fields = proc_stat_fields(pid)
+    except (OSError, IndexError, ValueError):
+        return False
+    return fields[19] == str(session.get("agent_pid_start"))
+
+
 # --- tool / event helpers ---
 
 
@@ -423,6 +466,8 @@ def load_session(tool, session_id):
         "last_activity_at": 0,
         "last_intervention_sent_at": 0,
         "last_sent_turn": 0,
+        "last_sent_reminder_at": 0,
+        "closed_at": 0,
         "turn": None,
     }
     data = read_json(session_path(tool, session_id))
@@ -446,6 +491,12 @@ def mark_turn_sent(tool, session_id, started_at):
 def mark_intervention_sent(tool, session_id):
     session = load_session(tool, session_id)
     session["last_intervention_sent_at"] = now_ts()
+    save_session(session)
+
+
+def mark_reminder_sent(tool, session_id, fire_at):
+    session = load_session(tool, session_id)
+    session["last_sent_reminder_at"] = float(fire_at)
     save_session(session)
 
 
@@ -532,6 +583,39 @@ def enqueue(config, kind, state, tool, session_id, project, turn_started_at=None
     return entry
 
 
+def schedule_reply_reminders(config, tool, session_id, project, anchor):
+    """Queue cache-expiry reminders for a claude session now waiting on the user.
+
+    Anchored at the last model activity (the cache clock resets there); the pair
+    is replaced wholesale on every stop/intervention and cancelled by any reply,
+    tool activity, SessionEnd, or the claude process dying.
+    """
+    if tool != "claude":
+        return
+    offsets = config["notify"]["reply_reminders"]
+    if not offsets:
+        return
+    cancel_session_entries(tool, session_id, ("reminder",), "rescheduled")
+    expires = anchor + config["notify"]["cache_ttl"]
+    for offset in offsets:
+        entry = {
+            "id": safe_state_name(
+                f"reminder__{tool}__{session_id}__{int(anchor * 1000)}__{int(offset)}"
+            ),
+            "kind": "reminder",
+            "state": f"{int(offset) // 60}分钟未回复",
+            "tool": tool,
+            "session_id": session_id,
+            "project": project,
+            "created_at": anchor,
+            "fire_at": anchor + offset,
+            "expires_at": expires,
+            "attempts": 0,
+        }
+        save_entry(entry)
+    spawn_watcher()
+
+
 def cancel_session_entries(tool, session_id, kinds, why):
     removed = 0
     for entry in queue_entries():
@@ -584,6 +668,8 @@ def send_batch(config, entries):
     for entry in entries:
         if entry.get("kind") == "intervention":
             mark_intervention_sent(entry["tool"], entry["session_id"])
+        elif entry.get("kind") == "reminder":
+            mark_reminder_sent(entry["tool"], entry["session_id"], entry.get("fire_at") or 0)
         elif entry.get("turn_started_at") is not None:
             mark_turn_sent(entry["tool"], entry["session_id"], entry["turn_started_at"])
     return True
@@ -596,7 +682,9 @@ def handle_prompt(info, tool, session_id):
     ts = now_ts()
     record_human_input(ts)
     # cancel first: even if this process is killed early, stale receipts are gone
-    cancel_session_entries(tool, session_id, ("completion", "intervention"), "session_continued")
+    cancel_session_entries(
+        tool, session_id, ("completion", "intervention", "reminder"), "session_continued"
+    )
     session = load_session(tool, session_id)
     session["last_input_at"] = ts
     session["last_activity_at"] = ts
@@ -605,6 +693,10 @@ def handle_prompt(info, tool, session_id):
         "cwd": extract_cwd(info),
         "explicit_notify": bool(EXPLICIT_NOTIFY_RE.search(extract_prompt(info))),
     }
+    if tool == "claude":
+        found = find_agent_pid()
+        if found:
+            session["agent_pid"], session["agent_pid_start"] = found
     save_session(session)
 
 
@@ -630,6 +722,8 @@ def handle_stop(info, tool, session_id, config):
 
     started = float(turn.get("started_at") or completed)
     project = project_label(turn.get("cwd"))
+    # the session now waits on the user; short turns still leave a warm cache
+    schedule_reply_reminders(config, tool, session_id, project, completed)
 
     if float(session.get("last_sent_turn") or 0) == started:
         log_decision("suppressed", event="stop", tool=tool, session=session_id, reason="already_sent")
@@ -668,6 +762,12 @@ def handle_stop(info, tool, session_id, config):
 
 def handle_intervention(info, tool, session_id, config, state):
     session = load_session(tool, session_id)
+    turn = session.get("turn")
+    cwd = turn.get("cwd") if isinstance(turn, dict) else extract_cwd(info)
+    project = project_label(cwd)
+    # scheduled even under cooldown: the session is stuck waiting either way
+    schedule_reply_reminders(config, tool, session_id, project, now_ts())
+
     cooldown = config["notify"]["intervention_cooldown"]
     if now_ts() - float(session.get("last_intervention_sent_at") or 0) < cooldown:
         log_decision(
@@ -675,10 +775,23 @@ def handle_intervention(info, tool, session_id, config, state):
         )
         return
 
-    turn = session.get("turn")
-    cwd = turn.get("cwd") if isinstance(turn, dict) else extract_cwd(info)
-    enqueue(config, "intervention", state, tool, session_id, project_label(cwd))
+    enqueue(config, "intervention", state, tool, session_id, project)
     log_decision("queued", event="intervention", tool=tool, session=session_id, state=state)
+
+
+def handle_session_end(info, tool, session_id):
+    # cancel first, same crash-safety reasoning as handle_prompt
+    cancel_session_entries(
+        tool, session_id, ("completion", "intervention", "reminder"), "session_closed"
+    )
+    session = load_session(tool, session_id)
+    session["closed_at"] = now_ts()
+    session["turn"] = None
+    save_session(session)
+    log_decision(
+        "closed", event="sessionend", tool=tool, session=session_id,
+        reason=str(info.get("reason") or ""),
+    )
 
 
 def handle_event(info, arg_tool=None):
@@ -692,6 +805,10 @@ def handle_event(info, arg_tool=None):
 
     if event in ("posttooluse", "posttoolusefailure"):
         handle_tool_event(info, tool, session_id)
+        return
+
+    if event == "sessionend":
+        handle_session_end(info, tool, session_id)
         return
 
     config = load_config(required=False)
@@ -780,6 +897,21 @@ def sweep_queue(config, present):
             remove_entry(entry["id"])
             log_decision("cancelled", kind=kind, session=entry.get("session_id"), reason="session_active")
             continue
+        if kind == "reminder":
+            # created_at is the anchor: the last model activity that reset the cache
+            reason = None
+            if float(session.get("closed_at") or 0) > created:
+                reason = "session_closed"
+            elif float(session.get("last_activity_at") or 0) > created:
+                reason = "session_active"
+            elif float(session.get("last_sent_reminder_at") or 0) == float(entry.get("fire_at") or -1):
+                reason = "already_sent"
+            elif not agent_alive(session):
+                reason = "session_gone"
+            if reason:
+                remove_entry(entry["id"])
+                log_decision("cancelled", kind=kind, session=entry.get("session_id"), reason=reason)
+                continue
         if now >= float(entry.get("expires_at") or 0):
             remove_entry(entry["id"])
             log_decision("expired", kind=kind, session=entry.get("session_id"))
@@ -802,21 +934,43 @@ def cmd_watch():
         entries = sweep_queue(config, present=not away)
         if not entries:
             return
-        if not away:
+        now = now_ts()
+        # due reminders bypass the presence gate: they are time-critical
+        # (cache expiry), and their main audience is a present-but-busy user
+        due = [
+            e for e in entries
+            if e.get("kind") == "reminder" and now >= float(e.get("fire_at") or 0)
+        ]
+        if due:
+            if send_batch(config, due):
+                for entry in due:
+                    remove_entry(entry["id"])
+                log_decision("sent_batch", count=len(due), kind="reminder")
+            else:
+                for entry in due:
+                    entry["attempts"] = int(entry.get("attempts", 0)) + 1
+                    if entry["attempts"] > 3:
+                        remove_entry(entry["id"])
+                        log_decision("failed", kind="reminder", session=entry.get("session_id"))
+                    else:
+                        save_entry(entry)
+                time.sleep(max(WATCH_POLL, 60))
+            continue
+        waiting = [e for e in entries if e.get("kind") != "reminder"]
+        if not away or not waiting:
             time.sleep(WATCH_POLL)
             continue
-        now = now_ts()
-        newest = max(float(e.get("created_at") or 0) for e in entries)
-        oldest = min(float(e.get("created_at") or 0) for e in entries)
+        newest = max(float(e.get("created_at") or 0) for e in waiting)
+        oldest = min(float(e.get("created_at") or 0) for e in waiting)
         if now - newest < debounce and now - oldest < DEBOUNCE_CAP:
             time.sleep(WATCH_POLL)  # more entries may be about to arrive; coalesce
             continue
-        if send_batch(config, entries):
-            for entry in entries:
+        if send_batch(config, waiting):
+            for entry in waiting:
                 remove_entry(entry["id"])
-            log_decision("sent_batch", count=len(entries))
+            log_decision("sent_batch", count=len(waiting))
             continue  # rescan: new entries may have arrived while we held the lock
-        for entry in entries:
+        for entry in waiting:
             entry["attempts"] = int(entry.get("attempts", 0)) + 1
             if entry["attempts"] > 3:
                 remove_entry(entry["id"])
@@ -899,6 +1053,7 @@ def cmd_install():
             "Notification": [{"hooks": [hook_entry(script, "claude", 5)]}],
             "StopFailure": [{"hooks": [hook_entry(script, "claude", 5)]}],
             "Stop": [{"hooks": [hook_entry(script, "claude", 10)]}],
+            "SessionEnd": [{"hooks": [hook_entry(script, "claude", 5)]}],
         }
     }
     print(json.dumps(claude_hooks, ensure_ascii=False, indent=2))
@@ -917,6 +1072,7 @@ def cmd_install():
     print(json.dumps(codex_hook_config, ensure_ascii=False, indent=2))
     print()
     print("v4 行为: 消息只有一行（目录名 + 状态词）；在场不打扰，离开后聚合推送，回到会话自动取消。")
+    print("回复提醒: Claude 会话停下后 40/50 分钟未回复各提醒一次（缓存过期前），关闭会话自动取消。")
     print("调试: llm-notify status 查看 presence 判定、队列与决策日志。")
 
 
@@ -948,10 +1104,13 @@ def cmd_status():
     for entry in entries:
         age = now_ts() - float(entry.get("created_at") or 0)
         left = float(entry.get("expires_at") or 0) - now_ts()
-        print(
+        line = (
             f"  {entry.get('kind'):12s} {entry.get('project') or 'unknown':20s} "
             f"{entry.get('state') or '完成':6s} 等待 {age:5.0f}s, TTL 剩 {max(0, left):5.0f}s"
         )
+        if entry.get("fire_at") is not None:
+            line += f", 距触发 {max(0, float(entry['fire_at']) - now_ts()):5.0f}s"
+        print(line)
 
     print(f"\n== watcher ==\n  {'运行中' if watcher_running() else '未运行'}")
 

@@ -26,6 +26,12 @@
 
 核心规则：在场永不打扰，离开立即知道，看过的永不补发。
 
+唯一的例外是未回复提醒：Claude Code 的模型缓存在最后一次活动约一小时后过期，过期后下一次回复要按全价重新处理整段上下文。因此 Claude 会话停下后，默认在 40 和 50 分钟各提醒一次"还没回复"，帮你赶在缓存过期前回到会话。回复、关闭会话或 claude 进程退出都会自动取消提醒；这类提醒不看在场状态，人在电脑前也照发，因为它面向的正是忙着别的事忘了回的你。
+
+```text
+[AI通知] llm-notify 40分钟未回复
+```
+
 ## 工作原理
 
 在场状态取三个信号中最新的一个：最近一次 `UserPromptSubmit` 的时间、`/dev/pts` 终端键盘活动时间，以及 WSL 下通过 `GetLastInputInfo` 读取的 Windows 全局键鼠空闲。所有信号静默超过 `presence.away_threshold` 秒（默认 120）即视为离开。某个信号不可用时自动退化到其余信号。
@@ -45,14 +51,21 @@ PostToolUse / PostToolUseFailure
 Stop
   耗时低于 notify.min_elapsed 的 turn 保持静默
   否则一条「完成」进入队列
+  Claude 会话另排 notify.reply_reminders 各档「未回复」提醒
 
 Notification（permission_prompt / elicitation_dialog）-> 「需确认」
 StopFailure                                          -> 「出错」
   每会话同时只挂一条，发送后有冷却
   idle_prompt 等其他通知类型一律忽略
+  Claude 会话同样刷新「未回复」提醒（卡住等确认也在烧缓存）
+
+SessionEnd（仅 Claude）
+  标记会话已关闭，取消该会话所有排队条目
 
 watch（单例，队列空了自动退出）
   每 30 秒检测一次在场状态
+  到点的「未回复」提醒无视在场判定直接发出，
+    发出前先确认会话没回复、没关闭、claude 进程还活着
   你在场时：完成条目排队超过 notify.seen_grace 秒即丢弃
     （你一直在机器前，结果已经看过了）
   你离开后：先等 notify.debounce 秒收拢陆续完成的任务，
@@ -119,7 +132,9 @@ chmod +x ~/.llm-notify/llm-notify
     "queue_ttl": 1800,
     "intervention_cooldown": 600,
     "debounce": 60,
-    "seen_grace": 180
+    "seen_grace": 180,
+    "cache_ttl": 3600,
+    "reply_reminders": [2400, 3000]
   }
 }
 ```
@@ -136,6 +151,8 @@ chmod +x ~/.llm-notify/llm-notify
 | `notify.intervention_cooldown` | 同一会话两次待确认提醒的最小间隔秒数 |
 | `notify.debounce` | 离开后 watcher 先等待该秒数收拢陆续完成的任务再发送 |
 | `notify.seen_grace` | 完成后你继续在场超过该秒数，该条按已看过丢弃 |
+| `notify.cache_ttl` | 模型缓存有效期秒数，超过后未发出的未回复提醒作废 |
+| `notify.reply_reminders` | Claude 会话停下后多少秒未回复时提醒，可配多档，置空关闭该功能 |
 
 ## Hook 配置
 
@@ -150,9 +167,10 @@ PostToolUseFailure
 Notification
 StopFailure
 Stop
+SessionEnd
 ```
 
-`llm-notify install` 会打印完整 JSON 片段。
+`llm-notify install` 会打印完整 JSON 片段。`SessionEnd` 供未回复提醒识别会话已手动关闭（`/exit`、Ctrl+D、`/clear` 等），不配置则只能靠进程存活检测兜底。
 
 ### Codex CLI
 
@@ -175,12 +193,13 @@ Codex 中需要运行 `/hooks` review/trust 这些命令 hook。
 
 ## 消息格式
 
-会话 cwd 的目录名，加空格，加三个状态词之一：`完成`（任务结束）、`需确认`（等待权限或 MCP 确认）、`出错`（该 turn 失败）。多个待发条目用 `·` 合并为一行，内容相同的条目只保留一个。
+会话 cwd 的目录名，加空格，加状态词：`完成`（任务结束）、`需确认`（等待权限或 MCP 确认）、`出错`（该 turn 失败），以及未回复提醒的 `40分钟未回复`（分钟数随配置档位）。多个待发条目用 `·` 合并为一行，内容相同的条目只保留一个。
 
 ```text
 [AI通知] llm-notify 完成
 [AI通知] llm-notify 需确认
 [AI通知] llm-notify 出错
+[AI通知] llm-notify 40分钟未回复
 [AI通知] llm-notify 完成 · data-pipeline 需确认
 ```
 
@@ -207,6 +226,8 @@ Codex 中需要运行 `/hooks` review/trust 这些命令 hook。
 | 提醒比预期晚 | 需要键鼠静默满 `away_threshold` 秒，再等 `notify.debounce` 秒收拢；watcher 每 30 秒轮询一次 |
 | 某次完成没有提醒 | 完成后你在机器前停留超过 `notify.seen_grace` 秒，该条按已看过丢弃（日志中 `cancelled/seen`） |
 | 短任务从不通知 | 耗时低于 `notify.min_elapsed` 秒的 turn 按设计静默 |
+| 会话关了还收到未回复提醒 | 直接关终端不触发 `SessionEnd`；提醒发出前会检查 claude 进程是否存活，日志中 `cancelled/session_gone` 表示已自动取消，若仍误报请确认 SessionEnd hook 已配置 |
+| 不想要未回复提醒 | `notify.reply_reminders` 置为 `[]` |
 | Codex hook 未触发 | 运行 `/hooks` review/trust，并确认 hooks 未被禁用 |
 
 ## 开发
