@@ -59,9 +59,9 @@ Hooks never send; the singleton watcher is the sole sender. While the user is pr
 Claude Code's prompt cache expires `notify.cache_ttl` (default 3600s) after the
 last model activity; replying later reprocesses the whole context at full
 price. When a claude session stops or gets stuck on a confirmation, llm-notify
-schedules one reminder per `notify.reply_reminders` tier (default 40 and 50
-minutes), anchored at that event. Codex sessions are excluded by design (cost
-profile does not justify it).
+schedules one reminder per `notify.reply_reminders` tier (default 25, 35, 45,
+and 55 minutes), anchored at that event. Codex sessions are excluded by design
+(cost profile does not justify it).
 
 A reminder is cancelled if, before it fires, the session sees a new prompt or
 tool activity, a `SessionEnd` hook marks it closed (`/exit`, Ctrl+D, `/clear`,

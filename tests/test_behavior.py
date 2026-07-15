@@ -18,7 +18,9 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-SCRIPT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "llm-notify")
+SCRIPT = os.environ.get("LLM_NOTIFY_SCRIPT") or os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "llm-notify"
+)
 
 
 class FeishuMock(BaseHTTPRequestHandler):
@@ -115,6 +117,28 @@ class LlmNotifyV4Test(unittest.TestCase):
             timeout=30,
         )
 
+    def run_init(self, reminders=""):
+        env = dict(
+            os.environ,
+            LLM_NOTIFY_CONFIG=self.config_path,
+            LLM_NOTIFY_STATE_DIR=self.state,
+            LLM_NOTIFY_NO_SPAWN="1",
+            LLM_NOTIFY_FAKE_IDLE="0",
+        )
+        answers = [self.webhook, "", "", "120", reminders]
+        return subprocess.run(
+            [sys.executable, SCRIPT, "init"],
+            input="\n".join(answers) + "\n",
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=30,
+        )
+
+    def read_config(self):
+        with open(self.config_path, encoding="utf-8") as f:
+            return json.load(f)
+
     def event(self, payload, idle=0, tool="claude"):
         result = self.run_cmd(["event", tool], payload, idle)
         self.assertEqual(result.returncode, 0, msg=result.stderr)
@@ -149,6 +173,34 @@ class LlmNotifyV4Test(unittest.TestCase):
 
     def stop(self, sid="s1", idle=0):
         self.event({"hook_event_name": "Stop", "session_id": sid, "cwd": self.tmp}, idle=idle)
+
+    # --- Init configuration ---
+
+    def test_init_defaults_to_four_reply_reminders(self):
+        result = self.run_init()
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertEqual(
+            self.read_config()["notify"]["reply_reminders"],
+            [1500, 2100, 2700, 3300],
+        )
+
+    def test_init_accepts_custom_reply_reminder_minutes(self):
+        result = self.run_init("10,20,30")
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertEqual(
+            self.read_config()["notify"]["reply_reminders"],
+            [600, 1200, 1800],
+        )
+
+    def test_init_can_disable_reply_reminders(self):
+        result = self.run_init("none")
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertEqual(self.read_config()["notify"]["reply_reminders"], [])
+
+    def test_init_rejects_invalid_reply_reminder_minutes(self):
+        result = self.run_init("35,25")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("未回复提醒必须是", result.stderr)
 
     # --- Stop decisions ---
 

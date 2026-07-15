@@ -154,7 +154,7 @@ def default_config():
             "debounce": 60,
             "seen_grace": 180,
             "cache_ttl": 3600,
-            "reply_reminders": [2400, 3000],
+            "reply_reminders": [1500, 2100, 2700, 3300],
         },
     }
 
@@ -1005,6 +1005,33 @@ def cmd_init():
     away_threshold = int(away_raw) if away_raw.isdigit() else 120
 
     config = default_config()
+    default_minutes = ",".join(
+        str(offset // 60) for offset in config["notify"]["reply_reminders"]
+    )
+    reminders_raw = input(
+        f"未回复提醒分钟数，逗号分隔，输入 none 关闭 [{default_minutes}]: "
+    ).strip()
+    if reminders_raw.lower() == "none":
+        config["notify"]["reply_reminders"] = []
+    elif reminders_raw:
+        try:
+            reminder_minutes = [
+                int(value.strip()) for value in reminders_raw.split(",")
+            ]
+        except ValueError:
+            reminder_minutes = []
+        cache_minutes = config["notify"]["cache_ttl"] // 60
+        if (
+            not reminder_minutes
+            or reminder_minutes != sorted(set(reminder_minutes))
+            or any(value <= 0 or value >= cache_minutes for value in reminder_minutes)
+        ):
+            print(
+                f"未回复提醒必须是小于 {cache_minutes} 的递增正整数，使用逗号分隔；输入 none 可关闭",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        config["notify"]["reply_reminders"] = [value * 60 for value in reminder_minutes]
     config.update({"webhook": webhook, "keyword": keyword})
     config["presence"]["away_threshold"] = away_threshold
     config["presence"]["windows_input"] = is_wsl()
@@ -1072,7 +1099,13 @@ def cmd_install():
     print(json.dumps(codex_hook_config, ensure_ascii=False, indent=2))
     print()
     print("v4 行为: 消息只有一行（目录名 + 状态词）；在场不打扰，离开后聚合推送，回到会话自动取消。")
-    print("回复提醒: Claude 会话停下后 40/50 分钟未回复各提醒一次（缓存过期前），关闭会话自动取消。")
+    default_minutes = "/".join(
+        str(offset // 60) for offset in default_config()["notify"]["reply_reminders"]
+    )
+    print(
+        f"回复提醒: Claude 会话停下后默认在 {default_minutes} 分钟提醒"
+        "（缓存过期前），关闭会话自动取消。"
+    )
     print("调试: llm-notify status 查看 presence 判定、队列与决策日志。")
 
 

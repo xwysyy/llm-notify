@@ -26,10 +26,10 @@ Delivery is gated by presence detection: keyboard and mouse signals decide wheth
 
 Core rule: never disturb a present user, tell an absent user immediately, never resend what the user has already seen.
 
-The one exception is reply reminders. Claude Code's model cache expires about an hour after the last activity, and replying after that reprocesses the whole context at full price. So when a Claude session stops and you have not replied, llm-notify pings you at 40 and 50 minutes by default, in time to get back before the cache dies. Replying, closing the session, or the claude process exiting cancels the reminders. These reminders ignore presence on purpose: their audience is you, at the machine, busy with something else.
+The one exception is reply reminders. Claude Code's model cache expires about an hour after the last activity, and replying after that reprocesses the whole context at full price. So when a Claude session stops and you have not replied, llm-notify pings you at 25, 35, 45, and 55 minutes by default, in time to get back before the cache dies. Replying, closing the session, or the claude process exiting cancels the reminders. These reminders ignore presence on purpose: their audience is you, at the machine, busy with something else.
 
 ```text
-[AI通知] llm-notify 40分钟未回复
+[AI通知] llm-notify 25分钟未回复
 ```
 
 ## How It Works
@@ -99,7 +99,7 @@ Use the Feishu desktop app.
 ~/.llm-notify/llm-notify init
 ```
 
-The prompt asks for the webhook, secret, keyword, and away threshold, then prints a presence self-check so you can confirm the signals work on your machine.
+The prompt asks for the webhook, secret, keyword, away threshold, and reply-reminder minutes, then prints a presence self-check so you can confirm the signals work on your machine. Reply-reminder minutes default to `25,35,45,55`; enter `none` to disable them.
 
 ### 4. Test Connectivity
 
@@ -135,7 +135,7 @@ The command prints Claude Code and Codex hook snippets.
     "debounce": 60,
     "seen_grace": 180,
     "cache_ttl": 3600,
-    "reply_reminders": [2400, 3000]
+    "reply_reminders": [1500, 2100, 2700, 3300]
   }
 }
 ```
@@ -194,13 +194,13 @@ Run `/hooks` in Codex to review and trust the command hooks.
 
 ## Message Format
 
-The directory basename of the session's cwd, a space, and a state word: `完成` (task finished), `需确认` (waiting for a permission or MCP confirmation), `出错` (the turn failed), or `40分钟未回复` (reply reminder; minutes follow the configured tier). Multiple pending items are joined with `·` into one line; identical items collapse into one.
+The directory basename of the session's cwd, a space, and a state word: `完成` (task finished), `需确认` (waiting for a permission or MCP confirmation), `出错` (the turn failed), or `25分钟未回复` (reply reminder; minutes follow the configured tier). Multiple pending items are joined with `·` into one line; identical items collapse into one.
 
 ```text
 [AI通知] llm-notify 完成
 [AI通知] llm-notify 需确认
 [AI通知] llm-notify 出错
-[AI通知] llm-notify 40分钟未回复
+[AI通知] llm-notify 25分钟未回复
 [AI通知] llm-notify 完成 · data-pipeline 需确认
 ```
 

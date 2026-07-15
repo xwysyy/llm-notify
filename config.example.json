@@ -13,6 +13,6 @@
     "debounce": 60,
     "seen_grace": 180,
     "cache_ttl": 3600,
-    "reply_reminders": [2400, 3000]
+    "reply_reminders": [1500, 2100, 2700, 3300]
   }
 }
